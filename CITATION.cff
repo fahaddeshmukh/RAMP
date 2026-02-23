@@ -1,0 +1,33 @@
+# This CITATION.cff file was generated for the RAMP Protocol.
+# https://citation-file-format.github.io/
+
+cff-version: 1.2.0
+title: "RAMP: Remote Agent Monitoring Protocol"
+message: "If you use RAMP in your research or product, please cite it using the metadata from this file."
+type: software
+authors:
+  - given-names: Fahad
+    family-names: Deshmukh
+    email: fahad.deshmukh@htw-berlin.de
+repository-code: "https://github.com/fahaddeshmukh/RAMP"
+url: "https://github.com/fahaddeshmukh/RAMP"
+abstract: >-
+  RAMP (Remote Agent Monitoring Protocol) is an open standard for
+  Agent-to-Human (A2H) communication, governance, and Human-in-the-Loop
+  (HITL) approval in autonomous AI agent systems. It defines a
+  transport-agnostic, cryptographically verifiable protocol for agent
+  telemetry, human decision routing, declarative governance policy
+  enforcement, and tamper-evident audit trails.
+keywords:
+  - ai-agents
+  - protocol
+  - human-in-the-loop
+  - agent-monitoring
+  - observability
+  - governance
+  - hitl
+  - mcp
+  - a2a
+license: Apache-2.0
+version: "0.2.0"
+date-released: "2026-02-23"

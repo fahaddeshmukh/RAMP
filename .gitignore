@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# RAMP runtime
+ramp_audit.db
+ramp_audit.db-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Private / internal docs (not for public repo)
+docs/competitive_analysis_and_strategy.md
+docs/_archive/
+
+# Pytest
+.pytest_cache/
