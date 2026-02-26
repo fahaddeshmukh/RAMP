@@ -51,8 +51,9 @@ def test_signature_is_deterministic():
     assert sign_envelope(env1, secret) == sign_envelope(env2, secret)
 
 
-def test_empty_signature_field_ignored():
-    """The signature field is zeroed before computation, so its prior value doesn't matter."""
+def test_signature_field_removed_before_signing():
+    """The signature field is removed entirely before canonicalization (spec §4.8.3).
+    Its value before signing does not matter — any prior value is stripped."""
     env = _make_envelope()
     secret = "test"
     env["signature"] = "garbage_value_that_should_be_ignored"
@@ -61,3 +62,25 @@ def test_empty_signature_field_ignored():
     env["signature"] = ""
     sig2 = sign_envelope(env, secret)
     assert sig == sig2
+
+
+def test_signature_has_hmac_sha256_prefix():
+    """Spec §4.8.3 step 6: signature MUST start with 'hmac-sha256:' followed by 64 hex chars."""
+    env = _make_envelope()
+    sig = sign_envelope(env, "any-key")
+    assert sig.startswith("hmac-sha256:"), f"Expected prefix, got: {sig[:20]}"
+    assert len(sig) == len("hmac-sha256:") + 64  # 64 lowercase hex chars for SHA-256
+
+
+def test_canonical_json_excludes_signature_field():
+    """Verify the canonical form used for signing does NOT contain the signature key."""
+    import json
+    from ramp_sdk.signing import _canonical_json
+
+    env = _make_envelope()
+    env["signature"] = "some_value"
+    # Build signable dict the same way sign_envelope does
+    signable = {k: v for k, v in env.items() if k != "signature"}
+    canonical = _canonical_json(signable).decode("utf-8")
+    parsed = json.loads(canonical)
+    assert "signature" not in parsed

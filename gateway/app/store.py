@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import asyncio
+
 import aiosqlite
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,12 @@ event_queues: dict[str, list[dict[str, Any]]] = {}
 
 # Global event list for the web UI
 _global_events: list[dict[str, Any]] = []
+
+# Long-poll coordination: message_id -> asyncio.Event (set when action is resolved)
+action_events: dict[str, asyncio.Event] = {}
+
+# Replay protection: nonce -> received_at unix timestamp (pruned after 5-minute window)
+seen_nonces: dict[str, float] = {}
 
 # ---------------------------------------------------------------------------
 # SQLite audit trail

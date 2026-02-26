@@ -24,17 +24,18 @@ class AgentState(str, enum.Enum):
 
 class NotificationPriority(str, enum.Enum):
     LOW = "low"
-    MEDIUM = "medium"
+    NORMAL = "normal"
     HIGH = "high"
     CRITICAL = "critical"
 
 
 class NotificationCategory(str, enum.Enum):
-    INFO = "info"
+    COMPLETION = "completion"
     WARNING = "warning"
     ERROR = "error"
-    COMPLETION = "completion"
+    INFO = "info"
     COST_ALERT = "cost_alert"
+    SECURITY = "security"
 
 
 class RiskLevel(str, enum.Enum):
@@ -55,6 +56,8 @@ class MessageType(str, enum.Enum):
     NOTIFICATION = "notification"
     ACTION_REQUEST = "action_request"
     ACTION_RESPONSE = "action_response"
+    POLICY_VIOLATION = "policy_violation"
+    AUDIT = "audit"
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +65,12 @@ class MessageType(str, enum.Enum):
 # ---------------------------------------------------------------------------
 
 class ResourceUsage(BaseModel):
-    tokens_used: int | None = None
+    """Agent resource consumption — field names match spec §5.2 wire format."""
+    llm_tokens_consumed: int | None = None
+    llm_cost_usd: float | None = None
     api_calls_made: int | None = None
-    estimated_cost_usd: float | None = None
-    custom: dict[str, Any] | None = None
+    wall_time_seconds: float | None = None
+    custom: dict[str, Any] | None = None  # non-spec extension field
 
 
 class ActionOption(BaseModel):
@@ -73,16 +78,17 @@ class ActionOption(BaseModel):
     label: str
     description: str | None = None
     confirmation_required: bool = False
-    risk_level: RiskLevel = RiskLevel.LOW
+    style: str | None = None
+    confirmation_message: str | None = None
 
 
 class RiskAssessment(BaseModel):
-    level: RiskLevel
+    risk_level: RiskLevel
     reversibility: Reversibility = Reversibility.REVERSIBLE
-    factors: list[str] = Field(default_factory=list)
+    impact_scope: str | None = None
     estimated_cost_usd: float | None = None
     action_category: str | None = None
-    explanation: str | None = None
+    justification: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -120,16 +126,18 @@ class TelemetryPayload(BaseModel):
 class NotificationPayload(BaseModel):
     title: str
     body: str
-    body_format: str = "text/plain"
-    priority: NotificationPriority = NotificationPriority.MEDIUM
+    body_format: str = "plaintext"  # spec §6.5: "plaintext" or "markdown"
+    priority: NotificationPriority = NotificationPriority.NORMAL
     category: NotificationCategory = NotificationCategory.INFO
+    expires_after_seconds: int | None = None  # spec §6.6: OPTIONAL
+    attachments: list[dict[str, Any]] | None = None  # spec §6.2
     metadata: dict[str, Any] | None = None
 
 
 class ActionRequestPayload(BaseModel):
     title: str
     body: str
-    body_format: str = "text/plain"
+    body_format: str = "plaintext"  # spec §6.5: "plaintext" or "markdown"
     options: list[ActionOption]
     timeout_seconds: int = 300
     fallback_action_id: str | None = None
@@ -139,8 +147,11 @@ class ActionRequestPayload(BaseModel):
 
 class ActionResponsePayload(BaseModel):
     request_message_id: str
-    resolution: str            # "approved", "denied", "modified", "timed_out"
+    resolution_type: str      # "human_decision", "timeout_fallback", "policy_auto_approved", "policy_auto_denied", "delegated", "escalated"
     selected_action_id: str | None = None
-    principal_id: str | None = None
-    modifications: dict[str, Any] | None = None
+    resolved_by: str | None = None
+    resolver_role: str | None = None
+    freeform_input: str | None = None
+    resolved_at: str | None = None
+    response_latency_ms: int | None = None
     reason: str | None = None

@@ -115,7 +115,7 @@ TERMINATED       → (none — terminal state)
 
 - An agent in `EXECUTING` that sends an Action Request MUST transition to `AWAITING_HUMAN_INPUT`.
 - An agent in `AWAITING_HUMAN_INPUT` that receives a human decision MUST transition to `EXECUTING` or `TERMINATED` (if the decision was "abort").
-- An agent in `AWAITING_HUMAN_INPUT` whose timeout expires MUST execute its declared `fallback_action_id` and transition accordingly.
+- An agent in `AWAITING_HUMAN_INPUT` whose timeout expires receives the Gateway-selected `fallback_action_id` as an Action Response and transitions accordingly.
 - An agent in `AWAITING_HUMAN_INPUT` MAY transition to `ERRORED` if a fault is detected during the waiting period (e.g., principal binding revoked, agent internal error, or Gateway connectivity loss).
 - A Human Principal MAY force any non-terminal agent into `SUSPENDED` at any time (the "Kill Switch").
 - A Gateway MAY force an agent into `SUSPENDED` if a policy violation is detected.
@@ -132,7 +132,7 @@ All RAMP messages share a common envelope. The payload varies by message type.
 {
   "ramp_version": "0.2.0",
   "message_id": "01936d87-7e1a-7f3b-a8c2-4d5e6f7a8b9c",
-  "message_type": "telemetry | notification | action_request | action_response | policy_violation | audit",
+  "message_type": "telemetry",
   "session_id": "sess_x9y8z7",
   "agent_id": "agent:ci_deployer_v3",
   "principal_id": "user:fahad",
@@ -151,7 +151,7 @@ All RAMP messages share a common envelope. The payload varies by message type.
 | `ramp_version` | string | YES | Semantic version of the RAMP protocol this message conforms to. |
 | `message_id` | string | YES | Globally unique identifier for this message. MUST be a UUID v7 or equivalent time-sortable ID. |
 | `message_type` | enum | YES | One of: `telemetry`, `notification`, `action_request`, `action_response`, `policy_violation`, `audit`. |
-| `session_id` | string | YES | Identifier for the agent's current execution session. A new session is created each time an agent transitions from `REGISTERED` to `IDLE`. |
+| `session_id` | string | YES | Identifier for the agent's current execution session. Sessions are created explicitly via `POST /ramp/v1/agents/{agent_id}/sessions` (Section 4.5) before the agent begins sending messages. |
 | `agent_id` | string | YES | Unique identifier for the agent. Format: `agent:<name>`. |
 | `principal_id` | string | YES | Identifier of the *primary* Human Principal (owner). The Gateway uses this plus the agent's Principal Bindings (Section 4.4) to route messages to all bound principals according to their roles. Format: `user:<id>` or `role:<id>`. |
 | `sequence_number` | integer | YES | Monotonically increasing integer per session. The Gateway MUST reject messages with sequence numbers ≤ the last received sequence number for that session (duplicate/replay protection). |
@@ -170,7 +170,7 @@ Before an agent can send any RAMP messages, it MUST register with the Gateway. R
 ```json
 {
   "agent_id": "agent:ci_deployer_v3",
-  "display_name": "CI/CD Deployment Agent",
+  "agent_name": "CI/CD Deployment Agent",
   "description": "Automated deployment agent for the payments microservice.",
   "version": "3.1.0",
   "conformance_level": 2,
@@ -198,28 +198,22 @@ Before an agent can send any RAMP messages, it MUST register with the Gateway. R
 }
 ```
 
-**Response (201 Created):**
+**Response (200 OK):**
 ```json
 {
+  "status": "registered",
   "agent_id": "agent:ci_deployer_v3",
-  "state": "REGISTERED",
-  "shared_secret": "ramp_sec_...",
-  "gateway_capabilities": {
-    "conformance_level": 3,
-    "supports_delegation": true,
-    "supports_multi_party_approval": true,
-    "max_payload_bytes": 65536
-  },
-  "assigned_policies": ["pol_default_v1"],
-  "registered_at": "2026-02-22T03:00:00.000Z"
+  "negotiated_version": "0.2",
+  "ramp_versions_supported": {"min": "0.2.0", "max": "0.2.0"},
+  "shared_secret": "ramp_sec_..."
 }
 ```
 
 **Registration Rules:**
 - The `shared_secret` returned during registration is used to compute HMAC signatures on all subsequent messages. It MUST be stored securely by the agent and MUST NOT be transmitted again after registration.
-- The Gateway MUST return its own capabilities so the agent knows what features are available (e.g., whether delegation is supported).
+- The Gateway SHOULD return discovery metadata in the registration response. Gateway capabilities are always discoverable via `GET /ramp/v1/info` (§4.7.3).
 - If the agent specifies `conformance_level: 2` but the Gateway only supports Level 1, the Gateway MUST reject registration with error `RAMP-4015: CONFORMANCE_MISMATCH`.
-- Re-registration of an existing `agent_id` MUST be treated as a key rotation event if the API key differs, or rejected with `RAMP-4006: DUPLICATE_MESSAGE` if identical.
+- Re-registration of an existing `agent_id` is rejected with `RAMP-4010: AGENT_ALREADY_REGISTERED`. Key rotation (re-registration with a new API key) is reserved for v0.3.
 - The `principal_bindings` array defines which Human Principals have access to this agent and what role each has. See Section 4.4 for the full binding model.
 
 ### 4.4 Principal Bindings
@@ -251,7 +245,7 @@ When an agent sends an Action Request and multiple principals are bound with the
 | `designated_approver` | Action Request is delivered to a specific principal based on `escalation` policy or rotation schedule. Others with approver role still see it as read-only. | Formal approval workflows. |
 | `n_of_m` (Section 7.6) | Action Request requires N approvals from M possible approvers. | High-risk actions. |
 
-The default routing mode is `first_response_wins`. The routing mode can be configured per-agent in the agent's policy.
+The default routing mode is `first_response_wins`. The routing mode is configured per-agent via a `routing_mode` field in the agent's policy document (Section 9.2). `n_of_m` routing is configured inline on the Action Request via the `approval_policy` field (Section 7.6). `designated_approver` routing uses an `escalation` rule (Section 9.3.9) to specify which principal receives a given request.
 
 **Conflict resolution:** If two approvers submit responses to the same Action Request within a race window:
 - The Gateway MUST accept the first response received (by Gateway timestamp).
@@ -288,7 +282,7 @@ The Gateway MUST respect role-based delivery rules:
 - **Telemetry**: Delivered to `owner`, `approver`, `observer`. NOT delivered to `auditor`.
 - **Notifications**: Delivered to `owner`, `approver`, `observer`. NOT delivered to `auditor`.
 - **Action Requests**: Delivered to `owner` and `approver` (interactive, can resolve). Also delivered to `observer` (read-only, no interactive buttons). NOT delivered to `auditor`.
-- **Policy Violations**: Delivered to `owner` only ($+$ any `notification_targets` specified in the violated rule).
+- **Policy Violations**: Delivered to `owner` only (plus any `notification_targets` specified in the violated rule).
 - **Emergency Override alerts**: Delivered to ALL bound principals regardless of role (safety mechanism).
 
 #### 4.4.5 Interaction with Escalation
@@ -306,12 +300,12 @@ Conversely, an `approver` binding does NOT automatically make someone an escalat
 
 Sessions group related messages from a single agent execution lifecycle. An agent MUST create a session before sending telemetry, notifications, or action requests.
 
-**Create Session — Endpoint:** `POST /ramp/v1/sessions`
+**Create Session — Endpoint:** `POST /ramp/v1/agents/{agent_id}/sessions`
 
 **Request Body:**
 ```json
 {
-  "agent_id": "agent:ci_deployer_v3",
+  "session_id": "sess_x9y8z7",
   "session_metadata": {
     "trigger": "github_push",
     "trigger_ref": "https://github.com/acme/payments/commit/abc123",
@@ -320,32 +314,29 @@ Sessions group related messages from a single agent execution lifecycle. An agen
 }
 ```
 
-**Response (201 Created):**
+**Response (200 OK):**
 ```json
 {
-  "session_id": "sess_x9y8z7",
-  "agent_id": "agent:ci_deployer_v3",
-  "state": "IDLE",
-  "created_at": "2026-02-22T03:15:00.000Z",
-  "sequence_number_start": 1
+  "status": "created",
+  "session_id": "sess_x9y8z7"
 }
 ```
 
-**End Session — Endpoint:** `DELETE /ramp/v1/sessions/{session_id}`
+**End Session — Endpoint:** `POST /ramp/v1/agents/{agent_id}/sessions/{session_id}/end`
 
 **Response (200 OK):**
 ```json
 {
-  "session_id": "sess_x9y8z7",
-  "final_state": "TERMINATED",
-  "total_messages": 42,
-  "duration_seconds": 547,
-  "audit_summary_uri": "ramp://audits/sess_x9y8z7/summary"
+  "status": "ended",
+  "session_id": "sess_x9y8z7"
 }
 ```
 
 **Session Rules:**
 - An agent MUST have exactly one active session at a time. Attempting to create a second session while one is active MUST return `RAMP-4016: SESSION_ALREADY_ACTIVE`.
+
+  > **Multi-tenant agents:** The single-session constraint is intentional — it preserves monotonic sequence number integrity (Section 4.2) and prevents audit trail fragmentation across concurrent sessions. For agents that serve multiple Human Principals simultaneously, the correct model is to register **multiple principal bindings** (Section 4.4) within a single session, not to open multiple simultaneous sessions. Each principal binding carries its own policy scope and can independently approve or deny Action Requests. Support for concurrent sessions with isolated sequence number namespaces is a v0.3 consideration (see Section 16, item 5: Shared Agents).
+
 - Ending a session automatically transitions the agent to `TERMINATED` state and creates a `session_ended` audit record.
 - If an agent disconnects without ending its session, the Gateway MUST apply an inactivity timeout (configurable, default: 3× the heartbeat interval) after which the session is force-closed and an audit record is created with `resolution_type: timeout`.
 - The `session_metadata` object is OPTIONAL but RECOMMENDED for traceability. It allows audit logs to correlate sessions with external triggers (e.g., a specific Git commit, a cron schedule, a user command).
@@ -510,7 +501,7 @@ Conformant implementations MUST apply the following rules when serializing a RAM
   - **JavaScript/TypeScript:** `json-canonicalize` (npm)
   - **Go:** `go-jose/canonicaljson`
   - **Java:** `org.erdtman:java-json-canonicalization`
-- The RAMP SDK (Appendix C) MUST handle canonicalization internally. Agent developers SHOULD NOT need to implement JCS manually.
+- The RAMP SDK (Appendix C) should handle canonicalization internally. Agent developers should not need to implement JCS manually.
 - The Gateway MUST reject messages whose `signature` does not match the recomputed HMAC over the canonical form with error code `RAMP-4002: INVALID_SIGNATURE`.
 
 ### 4.9 Idempotency
@@ -553,7 +544,7 @@ Telemetry messages report the agent's current lifecycle state, progress on tasks
     "api_calls_made": 7,
     "wall_time_seconds": 120
   },
-  "metadata": {
+  "context": {
     "framework": "langchain",
     "model": "claude-opus-4-20250514",
     "environment": "local"
@@ -589,6 +580,7 @@ Notifications are one-way informational messages that do not require a human dec
   "title": "Document Analysis Complete",
   "body": "Successfully generated summary of the Q3 earnings report. 47 pages processed, 3 key findings identified.",
   "body_format": "plaintext",
+  "expires_after_seconds": 3600,
   "attachments": [
     {
       "type": "link",
@@ -602,12 +594,7 @@ Notifications are one-way informational messages that do not require a human dec
       "size_bytes": 2048,
       "uri": "ramp://artifacts/01936d87-7e1a-7f3b-a8c2-4d5e6f7a8b9c/output.json"
     }
-  ],
-  "delivery_hints": {
-    "silent": false,
-    "ttl_seconds": 3600,
-    "collapse_key": "doc_analysis_batch_7"
-  }
+  ]
 }
 ```
 
@@ -642,11 +629,13 @@ The `body_format` field indicates the format of the `body` text. Clients MUST su
 
 If `body_format` is omitted, the Client MUST treat the body as `plaintext`.
 
-### 6.6 Delivery Hints
+### 6.6 Notification Expiry
 
-- `silent`: If true, the client SHOULD NOT vibrate or play a sound.
-- `ttl_seconds`: The message is considered stale after this duration and MAY be discarded.
-- `collapse_key`: Messages with the same collapse key replace each other in the UI (useful for frequently updating progress).
+The `expires_after_seconds` field is OPTIONAL. When present, it defines the maximum age (in seconds from `timestamp`) after which the notification is considered stale.
+
+- The Gateway MUST NOT deliver a notification to a Client if the notification has expired.
+- The Gateway SHOULD drop expired notifications from its delivery queue rather than accumulating them.
+- If `expires_after_seconds` is omitted, the notification does not expire and MUST be delivered regardless of delay.
 
 ---
 
@@ -677,46 +666,26 @@ Action Requests are the core HITL mechanism. They pause agent execution and requ
     {
       "action_id": "deploy_prod",
       "label": "Deploy to Production",
-      "style": "primary",
+      "style": "destructive",
       "confirmation_required": true,
       "confirmation_message": "This will deploy to production. Are you sure?"
     },
     {
       "action_id": "deploy_staging",
       "label": "Deploy to Staging Only",
-      "style": "secondary",
       "confirmation_required": false
     },
     {
       "action_id": "abort",
       "label": "Abort",
-      "style": "destructive",
       "confirmation_required": false
     }
   ],
-  "allow_freeform_response": true,
-  "freeform_hint": "Or type custom instructions...",
-  "timeout": {
-    "seconds": 300,
-    "fallback_action_id": "abort",
-    "notify_before_timeout_seconds": 60
-  },
-  "context": [
-    {
-      "label": "Test Results",
-      "type": "link",
-      "uri": "https://ci.example.com/run/1234"
-    },
-    {
-      "label": "Diff Summary",
-      "type": "inline_text",
-      "content": "+423 lines, -187 lines across 12 files"
-    }
-  ],
-  "delegation": {
-    "allow_delegation": true,
-    "allowed_delegates": ["user:sarah", "role:senior_engineer"],
-    "delegation_message": "Fahad is unavailable. You have been delegated this approval."
+  "timeout_seconds": 300,
+  "fallback_action_id": "abort",
+  "context": {
+    "test_results_url": "https://ci.example.com/run/1234",
+    "diff_summary": "+423 lines, -187 lines across 12 files"
   }
 }
 ```
@@ -725,13 +694,14 @@ Action Requests are the core HITL mechanism. They pause agent execution and requ
 
 1. An agent MUST transition to `AWAITING_HUMAN_INPUT` immediately after sending an Action Request.
 2. An agent MUST NOT send another Action Request while one is pending (one outstanding HITL per agent per session).
-3. The `timeout.seconds` field is REQUIRED. Maximum allowed value: 86400 (24 hours).
-4. The `timeout.fallback_action_id` MUST reference one of the `action_id` values in `options`.
-5. If the human does not respond within `timeout.seconds`, the Gateway MUST:
+3. The `timeout_seconds` field is REQUIRED. Maximum allowed value: 86400 (24 hours).
+4. The `fallback_action_id` MUST reference one of the `action_id` values in `options`.
+5. If the human does not respond within `timeout_seconds`, the Gateway MUST:
    a. Create an `action_resolved` audit record with `resolution_type: "timeout_fallback"`.
    b. Send an Action Response to the agent with `resolution_type: "timeout_fallback"` and `selected_action_id` set to the `fallback_action_id`.
 6. The `risk_assessment` object is REQUIRED on all Action Requests. Consistent with RAMP's governance-first design principle (Section 1.3, Principle 5), every action requiring human input MUST declare its risk profile, even if all fields are set to their lowest values (e.g., `risk_level: "low"`, `reversibility: "reversible"`). This forces agent developers to explicitly reason about risk at design time. The Gateway MUST reject Action Requests that omit `risk_assessment` with error code `RAMP-4001: INVALID_ENVELOPE`.
 7. Action Requests MUST NOT contain secrets, credentials, API keys, or unmasked payment instrument numbers in any field (`title`, `body`, `context`, or `options`). Agents MUST reference sensitive data by masked identifier only (e.g., "card ending in ••33", "AWS account ••7294"). The Gateway is not assumed to be a secure vault; sensitive data MUST remain in the agent's own secure storage.
+8. The `style` field on action options is OPTIONAL and is a rendering hint only — it MUST NOT affect protocol semantics (routing, policy evaluation, or audit recording). `style: "destructive"` and `confirmation_required: true` are independent: `confirmation_required` is the protocol-level gate that enforces an extra confirmation step before the action is submitted; `style: "destructive"` is a visual hint to the Client to render that option with warning emphasis. They may be combined, used independently, or omitted. Clients SHOULD render options with `style: "destructive"` with visual distinction (e.g., red or warning color). Recommended style values are listed in Appendix D.
 
 ### 7.4 Risk Assessment (REQUIRED)
 
@@ -742,7 +712,7 @@ The `risk_assessment` object is a REQUIRED field on every Action Request. It ser
 | `reversibility` | `reversible`, `partially_reversible`, `irreversible` |
 | `impact_scope` | `local`, `staging`, `production`, `external`, `financial` |
 | `risk_level` | `low`, `medium`, `high`, `critical` |
-| `action_category` | User-defined string (e.g., `send_email`, `purchase`, `deploy`, `delete_file`). Used by `action_scope` governance rules (Section 9.2.3) to enforce capability permissions. |
+| `action_category` | User-defined string (e.g., `send_email`, `purchase`, `deploy`, `delete_file`). Used by `action_scope` governance rules (Section 9.3.3) to enforce capability permissions. Also used by `data_access` rules (Section 9.3.8) when the category describes a data domain access intent (e.g., `read_calendar`, `read_health_data`). |
 | `estimated_cost_usd` | Numeric. Estimated monetary cost of the action. Used by `resource_constraint` and `aggregate_constraint` rules. |
 | `justification` | Free-text explanation of why this action carries its declared risk level. |
 
@@ -755,10 +725,14 @@ Action requests MAY support delegation to other authorized users. This enables:
 
 ### 7.6 Multi-Party Approval
 
-For high-risk actions, the agent MAY specify that multiple approvals are required:
+For high-risk actions, the agent MAY include an `approval_policy` field as a top-level sibling of `options` in the Action Request payload to require multiple approvals:
 
 ```json
 {
+  "options": [
+    {"action_id": "approve", "label": "Approve", "confirmation_required": true},
+    {"action_id": "deny", "label": "Deny"}
+  ],
   "approval_policy": {
     "type": "n_of_m",
     "required_approvals": 2,
@@ -837,17 +811,16 @@ Controls how much a single agent can spend within a session or time period.
 {
   "rule_id": "spend_limit",
   "type": "resource_constraint",
-  "constraint": {
-    "metric": "estimated_cost_usd",
-    "operator": "lte",
-    "value": 500,
-    "period": "per_session"
-  },
+  "resource": "llm_cost_usd",
+  "limit": 500,
+  "window": "session",
   "on_violation": "suspend_and_notify"
 }
 ```
 
-`period` values: `per_session`, `hourly`, `daily`, `sliding_window_24h`. The `sliding_window_*` variants prevent boundary gaming (e.g., spending $499 at 11:59 PM and $499 at 12:01 AM to bypass a $500 daily limit).
+`window` values: `session`, `hourly`, `daily`, `sliding_window_24h`. The `sliding_window_*` variants prevent boundary gaming (e.g., spending $499 at 11:59 PM and $499 at 12:01 AM to bypass a $500 daily limit). The `daily` period resets at midnight in the principal's configured timezone; if no timezone is configured, UTC is used.
+
+> **Implementation note (v0.2):** The reference Gateway enforces `session` semantics only. `hourly`, `daily`, and `sliding_window_*` values are accepted but treated as `session`. Full window-type support is reserved for v0.3.
 
 #### 9.3.2 `auto_resolution` — Automatic Approval/Denial
 
@@ -877,18 +850,16 @@ Controls *what categories of actions* an agent is permitted to take, regardless 
 {
   "rule_id": "allowed_actions",
   "type": "action_scope",
-  "scope": {
-    "allowed": ["read_email", "draft_email", "search_flights", "compare_prices"],
-    "denied": ["send_email", "purchase", "delete_file", "modify_calendar"]
-  },
+  "allowed_categories": ["read_email", "draft_email", "search_flights", "compare_prices"],
+  "denied_categories": ["send_email", "purchase", "delete_file", "modify_calendar"],
   "on_violation": "deny_and_notify"
 }
 ```
 
 **Evaluation rules:**
-- If `allowed` is specified, only those action categories are permitted. All others are implicitly denied.
-- If `denied` is specified, those categories are explicitly forbidden. All others are implicitly allowed.
-- If both are specified, `denied` takes precedence over `allowed` (explicit deny wins).
+- If `allowed_categories` is specified, only those action categories are permitted. All others are implicitly denied.
+- If `denied_categories` is specified, those categories are explicitly forbidden. All others are implicitly allowed.
+- If both are specified, `denied_categories` takes precedence over `allowed_categories` (explicit deny wins).
 - Action categories are matched against the `risk_assessment.action_category` field in the Action Request.
 - Action categories are user-defined strings. The Gateway MUST perform case-insensitive exact matching. Hierarchical categories (e.g., `email.send` vs `email.read`) are RECOMMENDED but not required.
 
@@ -900,11 +871,8 @@ Restricts when an agent is permitted to execute or send Action Requests.
 {
   "rule_id": "operating_hours",
   "type": "time_constraint",
-  "constraint": {
-    "allowed_hours": {"start": "08:00", "end": "22:00"},
-    "timezone": "America/New_York",
-    "days": ["mon", "tue", "wed", "thu", "fri"]
-  },
+  "allowed_days": ["mon", "tue", "wed", "thu", "fri"],
+  "allowed_hours_utc": {"start": "09:00", "end": "17:00"},
   "on_violation": "suspend_until_allowed"
 }
 ```
@@ -915,16 +883,14 @@ Forces human approval for specific categories of actions, overriding any `auto_r
 
 ```json
 {
-  "rule_id": "require_approval_irreversible",
+  "rule_id": "require_approval_high_risk",
   "type": "mandatory_hitl",
-  "condition": {
-    "field": "risk_assessment.reversibility",
-    "operator": "eq",
-    "value": "irreversible"
-  },
+  "trigger_risk_level": "high",
   "override_auto_approve": true
 }
 ```
+
+`trigger_risk_level` values: `low`, `medium`, `high`, `critical`. All actions with a `risk_assessment.risk_level` at or above `trigger_risk_level` require human approval; `policy_auto_approved` and `policy_auto_denied` resolution types are blocked for those actions.
 
 #### 9.3.6 `rate_constraint` — Rate Limiting
 
@@ -934,10 +900,8 @@ Prevents agent spam and runaway loops by limiting message throughput.
 {
   "rule_id": "rate_limit",
   "type": "rate_constraint",
-  "constraint": {
-    "max_messages_per_minute": 10,
-    "max_action_requests_per_hour": 20
-  },
+  "max_messages": 10,
+  "window_seconds": 60,
   "on_violation": "throttle_and_warn"
 }
 ```
@@ -950,28 +914,27 @@ Controls total spending across *all* agents for a given principal. Prevents the 
 {
   "rule_id": "global_daily_budget",
   "type": "aggregate_constraint",
-  "scope": "all_agents",
-  "constraint": {
-    "metric": "total_cost_usd",
-    "period": "sliding_window_24h",
-    "warning_threshold": 160,
-    "limit": 200
-  },
+  "scope": "principal",
+  "metric": "total_cost_usd",
+  "limit": 200,
+  "warning_threshold_pct": 80,
   "on_warning": "notify_principal",
   "on_violation": "suspend_all_and_notify"
 }
 ```
 
 **Aggregate constraint rules:**
-- `scope` values: `all_agents` (principal-wide), `agent_group:<name>` (subset of agents tagged into a group).
+- `scope` values: `principal` (all agents for the authenticated principal), `agent_group:<name>` (subset of agents tagged into a group).
 - When `warning_threshold` is reached, the Gateway MUST send a `cost_alert` notification but MUST NOT suspend agents.
 - When `limit` is reached, the Gateway MUST apply the `on_violation` action to ALL agents in scope.
 - `suspend_all_and_notify` suspends all agents in scope and sends a `policy_violation` notification listing aggregate spend breakdown per agent.
 - The Gateway MUST track cumulative spend using `resources.llm_cost_usd` from telemetry AND `risk_assessment.estimated_cost_usd` from Action Requests.
 
-#### 9.3.8 `data_access` — Privacy Governance
+#### 9.3.8 `data_access` — Privacy Governance — *Informative (Non-Normative)*
 
-Controls which data domains an agent may access, supporting GDPR Article 25 (data protection by design / data minimization). This rule type governs the Context Pull feature (Section 16, v0.3) but is defined in v0.2 to establish the governance model ahead of the feature.
+> **Note:** This rule type is informative. It describes a product-level governance extension that Gateway implementations MAY support. Data-domain access control can also be achieved through `action_scope` rules (Section 9.3.3) using data-domain action categories (e.g., `action_category: "read_health_data"`). Conformant RAMP implementations are NOT required to implement `data_access` as a separate rule type.
+
+Controls which data domains an agent may access, supporting GDPR Article 25 (data protection by design / data minimization). Data access governance is enforced independently of the mechanism agents use to access data, making it composable with external context protocols such as MCP (Anthropic's Model Context Protocol).
 
 ```json
 {
@@ -996,10 +959,12 @@ Controls which data domains an agent may access, supporting GDPR Article 25 (dat
 **Data access rules:**
 - `domain` is a user-defined string (e.g., `health`, `calendar`, `financial`, `location`, `contacts`, `email`). Domains are not a fixed enum — principals may define custom domains to match their data sources.
 - `access` values: `deny`, `read`, `write`, `read_write`.
-- When an agent attempts to access a denied domain (via the Context Pull API in v0.3+), the Gateway MUST reject the request with `RAMP-4011: POLICY_VIOLATION` and create an audit record.
-- The Gateway MUST enforce data access rules even if the agent SDK does not explicitly declare data intent. If no `data_access` rule exists for a domain, the Gateway's default policy MUST be `deny` (deny-by-default, allowlist model).
+- `data_access` rules are evaluated when an agent's Action Request declares a data access intent via the `action_category` field (e.g., `action_category: "read_calendar"` triggers evaluation against the `calendar` domain). The Gateway MUST reject the Action Request with `RAMP-4011: POLICY_VIOLATION` and create an audit record if the declared domain is denied.
+- If no `data_access` rule exists for a declared domain, the Gateway's default policy MUST be `deny` (deny-by-default, allowlist model).
 
-#### 9.3.9 `escalation` — Escalation Policy
+#### 9.3.9 `escalation` — Escalation Policy — *Informative (Non-Normative)*
+
+> **Note:** This rule type is informative. It describes a product-level routing extension that Gateway implementations MAY support. The core protocol supports escalation through the `fallback_action_id` timeout mechanism (Section 7.3). Multi-tier escalation with timezone-aware availability is a gateway product concern, not a protocol primitive.
 
 Defines an ordered chain of human responders when the primary principal is unavailable. Replaces the simple `timeout → fallback_action` model with a multi-tier escalation before resorting to the fallback.
 
@@ -1036,7 +1001,9 @@ Defines an ordered chain of human responders when the primary principal is unava
 - Escalation does NOT override `action_scope` or `mandatory_hitl` rules — it only changes *who* is asked, not *whether* asking is required.
 - Each escalation step produces an `escalation_triggered` audit record.
 
-#### 9.3.10 `geo_constraint` — Jurisdictional Boundaries
+#### 9.3.10 `geo_constraint` — Jurisdictional Boundaries — *Informative (Non-Normative)*
+
+> **Note:** This rule type is informative. Jurisdictional data residency is an infrastructure deployment concern, not a protocol primitive. Where a Gateway stores or processes data is determined by the Gateway operator's deployment architecture, not by the communication protocol. Gateway implementations MAY support `geo_constraint` rules, but conformant RAMP implementations are NOT required to.
 
 Restricts where agent data may be processed or stored, for compliance with data residency requirements (GDPR, data sovereignty laws, Schrems II).
 
@@ -1059,7 +1026,9 @@ Restricts where agent data may be processed or stored, for compliance with data 
 - This rule is evaluated at the Gateway level. Agent SDK is NOT required to enforce geo constraints — the Gateway is the enforcement point.
 - For multi-region Gateway deployments, the Gateway MUST route messages to nodes within the allowed jurisdictions.
 
-#### 9.3.11 `emergency_override` — Break Glass
+#### 9.3.11 `emergency_override` — Break Glass — *Informative (Non-Normative)*
+
+> **Note:** This rule type is informative. It describes a product-level safety feature that Gateway implementations MAY support. The specific mechanics (MFA requirements, cooldown timers, notification targets, enhanced audit levels) are gateway product decisions, not protocol primitives. The core protocol principle — that a Human Principal MUST always be able to suspend or terminate an agent (Section 3.3) — provides the baseline safety guarantee.
 
 Allows a Human Principal to temporarily bypass ALL governance rules in a genuine emergency. This is a safety mechanism — in extreme scenarios, governance rules must not prevent a human from taking necessary action.
 
@@ -1091,21 +1060,26 @@ Allows a Human Principal to temporarily bypass ALL governance rules in a genuine
 
 When multiple rules apply to the same Action Request, the Gateway MUST evaluate them in the following precedence order (highest priority first):
 
+**Normative (MUST implement for Level 3 conformance):**
 ```
-1. emergency_override    — If active, bypasses rules 3-7 (but NOT mandatory_hitl)
-2. mandatory_hitl        — Always enforced. Cannot be overridden.
-3. action_scope (deny)   — Explicit deny. Cannot be auto-approved.
-4. geo_constraint        — Jurisdictional deny. Cannot be overridden by spending rules.
-5. aggregate_constraint  — Cross-agent budget exceeded.
-6. resource_constraint   — Per-agent budget exceeded.
-7. time_constraint       — Outside operating hours.
-8. rate_constraint       — Rate limit exceeded (evaluated on message receipt, before content evaluation).
-9. data_access           — Evaluated on Context Pull requests (v0.3+).
+1. mandatory_hitl        — Always enforced. Cannot be overridden.
+2. action_scope (deny)   — Explicit deny. Cannot be auto-approved.
+3. aggregate_constraint  — Cross-agent budget exceeded.
+4. resource_constraint   — Per-agent budget exceeded.
+5. time_constraint       — Outside operating hours.
+6. rate_constraint       — Rate limit exceeded (evaluated on message receipt, before content evaluation).
+```
+
+**Informative (MAY implement — product-level extensions):**
+```
+7. emergency_override    — If active, bypasses rules 2-5 (but NOT mandatory_hitl).
+8. geo_constraint        — Jurisdictional deny.
+9. data_access           — Evaluated on data access requests.
 10. auto_resolution      — Auto-approve/deny. Only applied if NO higher-priority rule has triggered.
 11. escalation           — Determines WHO receives the Action Request, not WHETHER it's allowed.
 ```
 
-**Critical invariant:** A `deny` from rules 2-8 MUST NEVER be overridden by an `auto_resolution` rule. If an action is explicitly denied by scope or budget, the auto-approve rule is not evaluated. This prevents the dangerous case where a research agent auto-approves a $0-cost `send_email` action that should have been blocked by `action_scope`.
+**Critical invariant:** A `deny` from rules 1-6 MUST NEVER be overridden by an `auto_resolution` rule. If an action is explicitly denied by scope or budget, the auto-approve rule is not evaluated. This prevents the dangerous case where a research agent auto-approves a $0-cost `send_email` action that should have been blocked by `action_scope`.
 
 **Evaluation output:** The Gateway MUST include the full policy evaluation trace in the audit record:
 
@@ -1157,7 +1131,7 @@ Each governance rule specifies an `on_violation` field that determines the Gatew
 
 | Behavior | Semantics |
 |---|---|
-| `deny_and_notify` | The Gateway MUST reject the triggering message (Action Request, Context Pull, etc.) with `RAMP-4011: POLICY_VIOLATION`. The action is NOT executed. The Gateway MUST send a `policy_violation` notification to all principals with `owner` role. The agent remains in its current state (no state transition forced). |
+| `deny_and_notify` | The Gateway MUST reject the triggering message (e.g., Action Request, data access request) with `RAMP-4011: POLICY_VIOLATION`. The action is NOT executed. The Gateway MUST send a `policy_violation` notification to all principals with `owner` role. The agent remains in its current state (no state transition forced). |
 | `suspend_and_notify` | The Gateway MUST reject the triggering message AND force the agent into `SUSPENDED` state. The Gateway MUST send a `policy_violation` notification to all `owner` principals. The agent MUST NOT send further messages (except `telemetry` acknowledging the `SUSPENDED` state) until a principal with `owner` role explicitly resumes it via `POST /ramp/v1/agents/{agent_id}/resume`. |
 | `suspend_all_and_notify` | Same as `suspend_and_notify`, but applied to ALL agents in the scope defined by the rule (e.g., all agents for a given principal, or all agents in an agent group). Used exclusively by `aggregate_constraint` rules. The Gateway MUST send a single consolidated `policy_violation` notification listing all suspended agents and their individual contributions to the aggregate metric. |
 | `suspend_until_allowed` | The Gateway MUST force the agent into `SUSPENDED` state. Unlike `suspend_and_notify`, the Gateway automatically resumes the agent (transitions to `IDLE`) when the constraint condition is no longer violated (e.g., the operating hours window reopens). No manual human intervention is required for resumption. The Gateway MUST send a notification of category `info` to `owner` principals when the agent is automatically resumed, so owners are aware the agent has restarted. The Gateway MUST create audit records for both the suspension and the automatic resumption. |
@@ -1264,6 +1238,10 @@ Every meaningful event in the RAMP ecosystem produces an immutable audit record.
 | `audit_exported` | An audit export was performed (Section 10.5.3). Captures who, what range, and format (meta-audit). |
 | `agent_unresponsive` | Gateway detected agent unresponsiveness (no telemetry for 3× expected interval). Section 5.3. |
 | `action_expired_late_response` | A human approval was received after the Action Request timeout had elapsed and the agent had already executed the fallback. Records both the late response and the agent's `RAMP-4023` rejection. |
+| `corroboration_timeout` | Corroboration Hook did not return within the configured timeout. Gateway applied maximum-risk fallback (Section 11.1.2). |
+| `delivery_failed` | Gateway failed to deliver an Action Response or policy enforcement message to the agent webhook after all retries (Section 4.6.4). |
+
+> **Note:** `delivery_retry` events (logged between retry attempts per Section 4.6.4) are non-audit operational log entries — they are intentionally excluded from the hash-chained audit trail to avoid audit spam. Only the final `delivery_failed` event enters the audit chain.
 
 ### 10.4 Integrity Guarantees
 
@@ -1416,22 +1394,34 @@ For compliance reporting and integration with external SIEM (Security Informatio
 | **Compromised Gateway** | Audit trail hash chain allows detection of tampered records. Agents MAY independently log their own messages for reconciliation. |
 | **Social engineering via agent** | Action Requests with `risk_level: critical` or `irreversible` MUST require `confirmation_required: true`. Clients MUST display the agent's identity prominently. |
 | **Privilege escalation** | Policy engine enforces least-privilege per agent. An agent's API key is scoped to specific action categories. |
-| **Risk payload manipulation** | See Section 11.1.1 (Honest Agent Scope). |
+| **Risk payload manipulation** | Out-of-scope for honest-agent deployments (Section 11.1.1). Gateway implementors requiring verified risk corroboration SHOULD deploy a Corroboration Hook (Section 11.1.2), which overrides agent-declared `risk_assessment` values before policy evaluation and applies maximum-risk fallback on hook timeout. |
 
 #### 11.1.1 Honest Agent Scope
 
 RAMP's Gateway-enforced governance (Section 9) is designed to protect against **unsupervised autonomous drift, runaway loops, and unintentional policy violations by honest but imperfect agents**. The risk classification declared in `risk_assessment` (reversibility, estimated cost, action category) is agent-reported and is not independently verified by the Gateway at the protocol level.
 
-RAMP does **NOT** provide enforcement against actively malicious agents that deliberately misreport their `risk_assessment` payload to bypass governance controls (e.g., declaring `estimated_cost_usd: 0` for a $1,000 transaction to circumvent `resource_constraint` rules).
+RAMP does **NOT** provide enforcement against actively malicious agents that deliberately misreport their `risk_assessment` payload to bypass governance controls (e.g., declaring `estimated_cost_usd: 0` for a $1,000 transaction to circumvent `resource_constraint` rules). This scoping is consistent with analogous security boundaries in other infrastructure protocols: HTTP does not protect against a server that lies about its `Content-Length` header.
 
-Gateway implementors that require verified risk corroboration (e.g., reconciliation with external billing APIs, MCP tool invocation logs, or cloud cost APIs) SHOULD implement this as a Gateway-side extension. The RAMP protocol provides the attestation record (via the audit trail) but does not mandate how implementors verify the accuracy of agent-declared risk. This scoping is consistent with analogous security boundaries in other infrastructure protocols: HTTP does not protect against a server that lies about its `Content-Length` header.
+#### 11.1.2 Corroboration Hook (Gateway Extension Point)
+
+Gateway implementors that require verified risk corroboration MUST implement a **Corroboration Hook** — a synchronous, pluggable interface invoked by the Gateway **before** policy evaluation runs. The hook receives the full RAMP envelope and may override any agent-declared `risk_assessment` field with an externally verified value.
+
+**Interface contract:**
+
+- The Gateway MUST invoke the Corroboration Hook (if registered) on every inbound Action Request, before evaluating any policy rule.
+- The hook MUST return a corroborated `risk_assessment` object (full or partial override) within the Corroboration Timeout (configurable, default: 2 seconds).
+- The Gateway MUST use the hook's returned values (not agent-declared values) for all downstream policy evaluation when a hook is registered.
+- If the hook returns within the timeout, the Gateway MUST replace the agent-declared `risk_assessment` fields with the corroborated values and log **both** (agent-declared and corroborated) in the audit record for forensic comparison.
+- **Timeout behavior:** If the hook does not return within the Corroboration Timeout, the Gateway MUST treat the request as **maximum-risk** — applying `risk_level: critical` and `estimated_cost_usd: Infinity` — and route the Action Request to the Human Principal regardless of any `auto_resolution` rules. The Gateway MUST log a `corroboration_timeout` audit record.
+
+Hook implementations are not defined by RAMP — backend integrations are implementation details. RAMP defines the interface semantics only.
 
 ### 11.2 Authentication
 
 - **Agents → Gateway:** Scoped API key in the `Authorization` header + HMAC signature in the message envelope.
 - **Human Principal → Gateway:** OAuth 2.0 / OIDC (standard identity providers: Google, GitHub, corporate SSO).
 - **Gateway → Client (push):** APNs/FCM device tokens registered during client setup.
-- **Gateway → Agent (webhook):** Mutual TLS or pre-shared webhook secret for response delivery.
+- **Gateway → Agent (webhook):** HMAC-SHA256 signed payloads using the agent's `shared_secret` (Section 4.6.3). This is the pre-shared secret mechanism. Gateway implementations MAY additionally require mutual TLS as a transport-layer supplement, but HMAC signing is the normative authenticity mechanism.
 
 ### 11.3 Key Rotation
 
@@ -1446,8 +1436,8 @@ RAMP is transport-agnostic. This section defines conformant bindings for common 
 
 ### 12.1 HTTP Binding
 
-- Agent → Gateway: `POST /ramp/v1/messages` with JSON body containing the RAMP envelope.
-- Response: `201 Created` with the Gateway's acknowledgment including the `audit_id` assigned to the message.
+- Agent → Gateway: `POST /ramp/v1/agents/{agent_id}/messages` with JSON body containing the RAMP envelope (Section 4).
+- Response: `200 OK` with `{"status": "accepted", "message_id": "..."}`.
 - Errors: Standard RAMP error codes (Section 13) in the response body.
 
 ### 12.2 WebSocket Binding
@@ -1484,7 +1474,7 @@ RAMP is transport-agnostic. This section defines conformant bindings for common 
 | `RAMP-4007` | `DUPLICATE_NONCE` | The `(message_id, nonce)` pair has already been seen within the replay window (Section 4.2). |
 | `RAMP-4008` | `UNKNOWN_AGENT` | The `agent_id` is not registered with this Gateway. |
 | `RAMP-4009` | `UNAUTHORIZED_PRINCIPAL` | The agent is not authorized to send messages to this principal. |
-| `RAMP-4010` | `RESERVED` | Reserved for future use. |
+| `RAMP-4010` | `AGENT_ALREADY_REGISTERED` | Re-registration attempted with an identical payload for an already-registered `agent_id`. Use the key rotation path instead if the shared secret has changed. |
 | `RAMP-4011` | `POLICY_VIOLATION` | The action violates a governance policy. |
 | `RAMP-4012` | `HITL_ALREADY_PENDING` | Agent already has an outstanding Action Request in this session. |
 | `RAMP-4013` | `SESSION_EXPIRED` | The session has been terminated or has timed out. |
@@ -1497,7 +1487,7 @@ RAMP is transport-agnostic. This section defines conformant bindings for common 
 | `RAMP-4020` | `BINDING_NOT_FOUND` | The specified principal binding does not exist for this agent. |
 | `RAMP-4021` | `LAST_OWNER_BINDING` | Cannot remove the last `owner` binding. An agent MUST have at least one owner at all times. |
 | `RAMP-4022` | `INSUFFICIENT_ROLE` | The requesting principal does not have the required role for this operation (e.g., `observer` attempting to resolve an Action Request). |
-| `RAMP-4023` | `ACTION_EXPIRED` | Sent by an **Agent** to the Gateway after it has already executed the `timeout.fallback_action_id` and subsequently receives a late human Action Response. The Gateway MUST relay this error to the resolving principal with the message: "Your approval arrived after the timeout had elapsed and the fallback action was already executed." This prevents the agent from entering a split-state where both the fallback and the human-approved action execute concurrently. The Gateway MUST create an `action_expired_late_response` audit record capturing both the late approval and the agent's rejection of it. |
+| `RAMP-4023` | `ACTION_EXPIRED` | Sent by an **Agent** to the Gateway after it has already executed the `fallback_action_id` and subsequently receives a late human Action Response. The Gateway MUST relay this error to the resolving principal with the message: "Your approval arrived after the timeout had elapsed and the fallback action was already executed." This prevents the agent from entering a split-state where both the fallback and the human-approved action execute concurrently. The Gateway MUST create an `action_expired_late_response` audit record capturing both the late approval and the agent's rejection of it. |
 | `RAMP-5001` | `GATEWAY_ERROR` | Internal Gateway error. |
 | `RAMP-5002` | `DELIVERY_FAILED` | Gateway could not deliver the message to the Client (push notification failed). |
 
@@ -1533,7 +1523,9 @@ Implementations may claim conformance at different levels:
 - MUST implement canonical JSON serialization per RFC 8785 (Section 4.8) for all signature computations.
 - MUST support protocol version negotiation (Section 4.7).
 
-### 14.4 Level 4: Enterprise (Gateway + Multi-tenant)
+### 14.4 Level 4: Enterprise (Gateway + Multi-tenant) — *Informative (Non-Normative)*
+
+> **Note:** Level 4 describes product-level capabilities that enterprise Gateway implementations MAY support. These are not protocol conformance requirements. They are included to illustrate the governance surface that the protocol’s extension points enable.
 
 - All Level 3 requirements.
 - MUST support multi-principal routing.
@@ -1555,18 +1547,18 @@ Implementations may claim conformance at different levels:
 |---|---|---|---|
 | Agent → Human notifications | Not designed for this | Possible but awkward (human as "agent") | First-class primitive |
 | Structured HITL with timeout/fallback | No | Task "input needed" exists but lacks timeout, risk assessment, delegation | Full lifecycle support |
-| Governance policy enforcement | No | No | 11 rule types with formal precedence (Section 9) |
+| Governance policy enforcement | No | No | 7 normative rule types + 4 informative extensions, with formal precedence (Section 9) |
 | Capability permissions (action scope) | No | No | `action_scope` rules controlling what agents can do, not just spend |
 | Cross-agent budget controls | No | No | `aggregate_constraint` with sliding windows |
-| Privacy / data minimization (GDPR Art. 25) | No | No | `data_access` rules with deny-by-default |
-| Jurisdictional data residency | No | No | `geo_constraint` with ISO 3166 jurisdictions |
-| Escalation chains | No | No | Multi-tier with timezone-aware availability |
-| Emergency override (break glass) | No | No | MFA-gated with enhanced audit and auto-expiry |
+| Privacy / data minimization (GDPR Art. 25) | No | No | Achievable via `action_scope` rules; dedicated `data_access` rule type available as informative extension |
+| Jurisdictional data residency | No | No | `geo_constraint` available as informative extension (infrastructure concern) |
+| Escalation chains | No | No | Informative extension — multi-tier with timezone-aware availability |
+| Emergency override (break glass) | No | No | Informative extension — MFA-gated with enhanced audit and auto-expiry |
 | Tamper-evident audit trail | No | No | Hash-chained audit records |
 | Agent lifecycle state machine | No | Task states exist but are task-scoped, not agent-scoped | Agent-scoped formal FSM |
 | Multi-party approval | No | No | N-of-M approval support |
 | Rate limiting / spend controls | No | No | Policy-based enforcement |
-| Cross-agent dependency tracking | No | Implicit via task delegation | Planned (v0.3). Aggregate constraints provide partial cross-agent awareness. |
+| Cross-agent dependency tracking | No | Implicit via task delegation | `aggregate_constraint` provides cross-agent budget awareness. Full dependency tracking is out of scope. |
 | Multi-principal agent monitoring | No | No | Role-based bindings (owner, approver, observer, auditor) with first-response-wins and N-of-M routing |
 
 ---
@@ -1575,23 +1567,17 @@ Implementations may claim conformance at different levels:
 
 The following capabilities are explicitly deferred to future protocol versions:
 
-1. **Context Pull Protocol (Human → Agent):** Standardized mechanism for agents to request personal context (health, calendar, financial data) from the Human Principal's data sources via the Gateway. Deferred due to privacy and consent design complexity. RAMP v0.3 will introduce a **consent-gated Context Protocol** where agents must hold explicit, revocable, scope-limited data-access grants (modeled on OAuth 2.0 scopes) before querying any personal telemetry. Grants will be auditable, time-bounded, and independently revocable per agent and per data domain.
+1. **Context Pull (Intentionally Out of Scope — Use MCP):** In-band agent access to personal data sources (health, calendar, financial) is intentionally outside RAMP's scope. RAMP is designed to **compose with** [Anthropic's Model Context Protocol (MCP)](https://modelcontextprotocol.io/), which already provides standardized, consent-gated agent access to tools and data sources. RAMP handles governance, oversight, and human-in-the-loop routing; MCP handles context and tool access. Combining them yields a complete, non-overlapping stack: MCP answers "what can the agent access?" and RAMP answers "what is the agent about to do, and does a human need to approve it?" Adding a competing context-pull mechanism to RAMP would duplicate existing standardization work and dilute this positioning.
 
-2. **Agent Reputation & Progressive Trust:** A Gateway-computed reliability score based on historical agent behavior (error rates, policy violations, HITL response patterns). Agents that operate without violations over sustained periods may earn dynamically increasing `auto_resolution` thresholds (e.g., auto-approve limit increases from $50 to $500 over 30 clean sessions), with automatic reset on policy violation. This creates an incentive structure for well-behaved agents while maintaining safety guarantees.
+2. **Cross-Gateway Federation:** Mechanism for agents supervised by different Gateways to participate in coordinated workflows while maintaining independent audit trails.
 
-3. **Cross-Gateway Federation:** Mechanism for agents supervised by different Gateways to participate in coordinated workflows while maintaining independent audit trails.
+3. **Batch Action Requests:** Support for agents to request approval for bulk operations (e.g., "Send 200 personalized emails") via a `batch_action_request` message type. The Client would render a sample of representative items (e.g., 3 of 200 emails) with options to [Approve All], [Review Individually], or [Abort]. This prevents the UX antipattern of 200 sequential HITL requests while maintaining human oversight over bulk operations.
 
-4. **Natural Language Action Requests:** Support for agents to describe needed actions in natural language, with the Client using an LLM to generate appropriate option buttons dynamically.
+4. **Agent Versioning & Hot-Swap:** Protocol support for updating an agent's code mid-lifecycle. Defines whether a running session should be gracefully terminated and re-registered, or whether the session can be inherited by the new version with a version-transition audit record.
 
-5. **Streaming Telemetry:** Support for continuous streaming of agent reasoning traces (token-by-token) for real-time observability of agent "thinking."
+5. **Shared Agents (Multi-Principal):** Support for agents that serve multiple Human Principals simultaneously (e.g., a family calendar agent serving both partners). Defines shared ownership semantics, per-principal policy scoping, and conflict resolution when principals issue contradictory directives to the same agent.
 
-6. **Batch Action Requests:** Support for agents to request approval for bulk operations (e.g., "Send 200 personalized emails") via a `batch_action_request` message type. The Client would render a sample of representative items (e.g., 3 of 200 emails) with options to [Approve All], [Review Individually], or [Abort]. This prevents the UX antipattern of 200 sequential HITL requests while maintaining human oversight over bulk operations.
-
-7. **Agent Conflict Resolution & Resource Locking:** Mechanism for agents to declare exclusive claims on shared resources (e.g., "I am claiming the user's calendar from 2-4 PM"). When two agents submit conflicting Action Requests (e.g., scheduling agent books a meeting at 3 PM while travel agent books a 2:30 PM flight), the Gateway would detect the conflict and bundle both into a single "conflict resolution" notification, presenting the Human Principal with a unified choice.
-
-8. **Agent Versioning & Hot-Swap:** Protocol support for updating an agent's code mid-lifecycle. Defines whether a running session should be gracefully terminated and re-registered, or whether the session can be inherited by the new version with a version-transition audit record.
-
-9. **Shared Agents (Multi-Principal):** Support for agents that serve multiple Human Principals simultaneously (e.g., a family calendar agent serving both partners). Defines shared ownership semantics, per-principal policy scoping, and conflict resolution when principals issue contradictory directives to the same agent.
+> **Note:** High-frequency telemetry (e.g., sub-second progress updates) is already supported via the WebSocket transport binding (Section 12.2) and does not require a separate protocol extension.
 
 ---
 
@@ -1629,36 +1615,61 @@ The following capabilities are explicitly deferred to future protocol versions:
 ## Appendix C: SDK Pseudocode (Python)
 
 ```python
-from ramp_sdk import RAMPAgent
+import asyncio
+from ramp_sdk import RampAgent, RiskAssessment, AgentState
 
-agent = RAMPAgent(
-    agent_id="travel_booker_v2",
-    api_key="ramp_agt_sk_...",
-    gateway_url="https://gateway.ramp-protocol.dev/ramp/v1"
-)
+async def main():
+    async with RampAgent(
+        agent_id="travel_booker_v2",
+        api_key="ramp_agt_sk_...",
+        gateway_url="https://gateway.ramp-protocol.dev",
+    ) as agent:
+        # Report progress
+        await agent.send_telemetry(
+            state=AgentState.EXECUTING,
+            task_description="Searching flights",
+            progress_pct=30,
+        )
 
-# Start session
-agent.start_session()
+        # Request human approval
+        response = await agent.request_action(
+            title="Book Flight?",
+            body="Found NYC→LON for $420 on British Airways, Mar 15.",
+            risk=RiskAssessment(
+                risk_level="medium",
+                reversibility="partially_reversible",
+                estimated_cost_usd=420,
+                action_category="purchase",
+            ),
+            options=[
+                {"action_id": "book", "label": "Book It"},
+                {"action_id": "skip", "label": "Skip"},
+            ],
+            timeout_seconds=600,
+            fallback_action_id="skip",
+        )
 
-# Report progress
-agent.telemetry(task="Searching flights", progress=30)
+        if response.selected_action_id == "book":
+            await agent.send_notification(
+                title="Flight Booked",
+                body="NYC→LON, Mar 15, $420",
+                priority="normal",
+            )
+        # Session ends automatically when the `async with` block exits
 
-# Request human approval
-response = agent.request_action(
-    title="Book Flight?",
-    body="Found NYC→LON for $420 on British Airways, Mar 15.",
-    risk={"reversibility": "partially_reversible", "estimated_cost_usd": 420, "risk_level": "medium", "action_category": "purchase"},
-    options=[
-        {"action_id": "book", "label": "Book It", "style": "primary"},
-        {"action_id": "skip", "label": "Skip", "style": "secondary"},
-    ],
-    timeout_seconds=600,
-    fallback="skip"
-)
-
-if response.selected_action_id == "book":
-    # proceed to book
-    agent.notify(title="Flight Booked", body="NYC→LON, Mar 15, $420", priority="normal")
-
-agent.end_session()
+asyncio.run(main())
 ```
+
+## Appendix D: Action Option Style Values — *Informative (Non-Normative)*
+
+> **Note:** This appendix is informative. Conformant implementations are NOT required to support or render these style values. The `style` field is defined in Section 7.3.
+
+The `style` field on action options is an OPTIONAL hint to Client applications for rendering visual emphasis. Recommended values:
+
+| Style | Recommended Rendering |
+|---|---|
+| `"primary"` | Prominent or highlighted button (e.g., filled, bold). Used for the recommended or default action. |
+| `"secondary"` | Standard button appearance. Used for alternative actions. |
+| `"destructive"` | Warning-colored button (e.g., red). Used for irreversible or high-risk actions. Clients SHOULD render destructive options with visual distinction to signal risk. |
+
+Clients that do not recognize the `style` value MUST fall back to rendering the option as a standard button. The `style` field MUST NOT affect protocol semantics — it is a rendering hint only.

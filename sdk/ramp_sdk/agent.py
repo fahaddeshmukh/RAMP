@@ -21,9 +21,10 @@ Usage::
                 ActionOption(action_id="book", label="Book it"),
                 ActionOption(action_id="skip", label="Skip"),
             ],
-            risk=RiskAssessment(level="medium", factors=["$420 charge"], estimated_cost_usd=420.0),
+            risk=RiskAssessment(risk_level="medium", estimated_cost_usd=420.0,
+                                justification="$420 charge to credit card"),
         )
-        if response.resolution == "approved":
+        if response.resolution_type == "human_decision" and response.selected_action_id == "book":
             print("Booking confirmed!")
 """
 
@@ -117,8 +118,12 @@ class RampAgent:
     async def __aexit__(self, *exc: Any) -> None:
         try:
             await self.send_telemetry(state=AgentState.TERMINATED)
-            await self._end_session()
         finally:
+            # Always end the session, even if terminal telemetry fails
+            try:
+                await self._end_session()
+            except Exception:
+                pass
             if self._client:
                 await self._client.aclose()
                 self._client = None
@@ -154,8 +159,8 @@ class RampAgent:
         self,
         title: str,
         body: str,
-        body_format: str = "text/plain",
-        priority: NotificationPriority | str = NotificationPriority.MEDIUM,
+        body_format: str = "plaintext",
+        priority: NotificationPriority | str = NotificationPriority.NORMAL,
         category: NotificationCategory | str = NotificationCategory.INFO,
         metadata: dict[str, Any] | None = None,
     ) -> dict:
@@ -181,7 +186,7 @@ class RampAgent:
         body: str,
         options: list[ActionOption | dict],
         risk: RiskAssessment | dict,
-        body_format: str = "text/plain",
+        body_format: str = "plaintext",
         timeout_seconds: int = 300,
         fallback_action_id: str | None = None,
         context: dict[str, Any] | None = None,
@@ -207,10 +212,16 @@ class RampAgent:
             context=context,
         )
 
-        # Send the request
+        # Send the request (spec Appendix A step 2: Action Request fires first)
         result = await self._send(
             MessageType.ACTION_REQUEST,
             payload.model_dump(exclude_none=True),
+        )
+
+        # Spec Appendix A step 3: emit AWAITING_HUMAN_INPUT telemetry after sending the request
+        await self.send_telemetry(
+            state=AgentState.AWAITING_HUMAN_INPUT,
+            task_description=f"Awaiting human decision: {title}",
         )
 
         request_message_id = result.get("message_id")
@@ -271,7 +282,7 @@ class RampAgent:
             agent_id=self.agent_id,
             principal_id=self.principal_id,
             sequence_number=self._seq,
-            timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds") + "Z",
+            timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
             nonce=nonce,
             payload=payload,
         )
@@ -291,21 +302,44 @@ class RampAgent:
         request_message_id: str,
         timeout_seconds: int,
     ) -> ActionResponsePayload:
-        """Poll the gateway for an action response."""
-        url = f"/ramp/v1/agents/{self.agent_id}/actions/{request_message_id}/response"
-        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        """Wait for the human's response using long-polling.
 
-        while asyncio.get_event_loop().time() < deadline:
-            resp = await self._get(url)
+        The gateway holds each request open for up to 30 seconds (via the
+        ``wait`` query parameter) before returning ``{"status": "pending"}``.
+        This eliminates the need for rapid polling and delivers responses
+        within milliseconds of resolution.
+        """
+        base_url = f"/ramp/v1/agents/{self.agent_id}/actions/{request_message_id}/response"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        long_poll_wait = 30  # seconds per long-poll request
+
+        while loop.time() < deadline:
+            remaining = deadline - loop.time()
+            wait = min(long_poll_wait, max(int(remaining), 1))
+
+            try:
+                resp = await self._get(f"{base_url}?wait={wait}")
+            except RampError:
+                # Gateway may not support long-polling — fall back to short poll
+                try:
+                    resp = await self._get(base_url)
+                except RampError:
+                    await asyncio.sleep(2.0)
+                    continue
+                if resp.get("status") == "resolved":
+                    return ActionResponsePayload(**resp["response"])
+                await asyncio.sleep(2.0)
+                continue
+
             if resp.get("status") == "resolved":
                 return ActionResponsePayload(**resp["response"])
-            # Wait before polling again
-            await asyncio.sleep(2.0)
+            # Server already waited — loop immediately
 
         # Timeout — return timed_out response
         return ActionResponsePayload(
             request_message_id=request_message_id,
-            resolution="timed_out",
+            resolution_type="timeout_fallback",
         )
 
     # ------------------------------------------------------------------

@@ -54,7 +54,7 @@ async def main():
             state=AgentState.EXECUTING,
             task_description="Checking Delta, United, American...",
             progress_pct=40,
-            resources={"tokens_used": 1200, "api_calls_made": 3, "estimated_cost_usd": 0.05},
+            resources={"llm_tokens_consumed": 1200, "api_calls_made": 3, "llm_cost_usd": 0.05},
         )
         await asyncio.sleep(2)
 
@@ -64,7 +64,7 @@ async def main():
             state=AgentState.EXECUTING,
             task_description="Found 3 matching flights",
             progress_pct=70,
-            resources={"tokens_used": 2400, "api_calls_made": 6, "estimated_cost_usd": 0.12},
+            resources={"llm_tokens_consumed": 2400, "api_calls_made": 6, "llm_cost_usd": 0.12},
         )
 
         await agent.send_notification(
@@ -74,8 +74,8 @@ async def main():
                 "2. **United UA-1891** — $385, 7h 15m, 1 stop\n"
                 "3. **American AA-119** — $510, 5h 45m, nonstop"
             ),
-            body_format="text/markdown",
-            priority="medium",
+            body_format="markdown",
+            priority="normal",
             category="info",
         )
         await asyncio.sleep(1)
@@ -94,47 +94,44 @@ async def main():
                 "- Seat: 14A (window)\n\n"
                 "Card ending in **••42** will be charged."
             ),
-            body_format="text/markdown",
+            body_format="markdown",
             options=[
                 ActionOption(
                     action_id="book",
                     label="Book this flight",
                     description="Charge $420 to card ending ••42",
-                    risk_level="medium",
                 ),
                 ActionOption(
                     action_id="book_cheapest",
                     label="Book cheapest instead",
                     description="Book United UA-1891 for $385",
-                    risk_level="medium",
                 ),
                 ActionOption(
                     action_id="skip",
                     label="Don't book",
                     description="Cancel and keep searching",
-                    risk_level="low",
                 ),
             ],
             risk=RiskAssessment(
-                level="medium",
+                risk_level="medium",
                 reversibility="irreversible",
-                factors=["$420 charge to credit card", "Non-refundable ticket"],
                 estimated_cost_usd=420.0,
-                explanation="This will charge your credit card. The ticket is non-refundable after 24 hours.",
+                action_category="purchase",
+                justification="$420 charge to credit card. Non-refundable ticket after 24 hours.",
             ),
             timeout_seconds=120,
             fallback_action_id="skip",
         )
 
         # --- Step 5: Handle response ---
-        print(f"[Agent] Human responded: {response.resolution} (action: {response.selected_action_id})")
+        print(f"[Agent] Human responded: {response.resolution_type} (action: {response.selected_action_id})")
 
-        if response.resolution == "approved" and response.selected_action_id == "book":
+        if response.resolution_type == "human_decision" and response.selected_action_id == "book":
             await agent.send_telemetry(
                 state=AgentState.EXECUTING,
                 task_description="Booking Delta DL-402...",
                 progress_pct=90,
-                resources={"tokens_used": 3000, "api_calls_made": 8, "estimated_cost_usd": 420.15},
+                resources={"llm_tokens_consumed": 3000, "api_calls_made": 8, "llm_cost_usd": 420.15},
             )
             await asyncio.sleep(2)
             await agent.send_notification(
@@ -145,7 +142,7 @@ async def main():
             )
             print("[Agent] Flight booked successfully!")
 
-        elif response.resolution == "approved" and response.selected_action_id == "book_cheapest":
+        elif response.resolution_type == "human_decision" and response.selected_action_id == "book_cheapest":
             await agent.send_telemetry(
                 state=AgentState.EXECUTING,
                 task_description="Booking United UA-1891...",
@@ -160,11 +157,11 @@ async def main():
             )
             print("[Agent] Cheapest flight booked!")
 
-        elif response.resolution == "timed_out":
+        elif response.resolution_type == "timeout_fallback":
             await agent.send_notification(
                 title="Booking timed out",
                 body="No response received within 2 minutes. Flight was not booked.",
-                priority="medium",
+                priority="normal",
                 category="warning",
             )
             print("[Agent] Timed out, no booking made.")

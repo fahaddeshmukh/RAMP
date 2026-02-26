@@ -34,6 +34,7 @@ Thumbs.db
 .env.local
 
 # Private / internal docs (not for public repo)
+docs/internal/
 docs/competitive_analysis_and_strategy.md
 docs/_archive/
 
