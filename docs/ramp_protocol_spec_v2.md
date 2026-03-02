@@ -1,10 +1,12 @@
-# RAMP Protocol Specification v0.2 (Draft)
+# RAMP Protocol Specification v0.2
 # Remote Agent Monitoring Protocol
 
-**Status:** Draft  
+**Status:** Public Draft  
 **Version:** 0.2.0  
 **Date:** 2026-02-22  
 **Author:** Fahad Deshmukh (fahad.deshmukh@htw-berlin.de)  
+**License:** Apache-2.0  
+**Repository:** https://github.com/fahaddeshmukh/RAMP  
 
 ---
 
@@ -18,7 +20,7 @@ RAMP (Remote Agent Monitoring Protocol) fills this gap. It defines a transport-a
 3. **Governance** — Agents operate within declarative policy boundaries enforced by the protocol gateway.
 4. **Auditability** — All agent actions and human decisions produce a tamper-evident, hash-chained audit trail.
 
-RAMP is designed to support compliance with the human oversight requirements of the EU AI Act (Article 14), the US Executive Order on AI Safety, and ISO/IEC 42001. Formal regulatory conformance mappings are planned for future versions; this draft establishes the architectural foundations necessary for such mappings.
+RAMP is designed to support compliance with the human oversight requirements of the EU AI Act (Article 14) and ISO/IEC 42001. Formal regulatory conformance mappings are planned for future versions; this specification establishes the architectural foundations necessary for such mappings.
 
 ---
 
@@ -605,7 +607,7 @@ Notifications are one-way informational messages that do not require a human dec
 | `low` | Silent delivery. Added to inbox only. |
 | `normal` | Standard push notification. |
 | `high` | Persistent notification. Badge on app icon. |
-| `critical` | Overrides Do Not Disturb. Audible alert. Requires explicit dismissal. |
+| `critical` | Highest urgency. SHOULD be treated as requiring immediate attention. Client rendering behavior (e.g., overriding silent mode, requiring explicit dismissal) is an implementation decision. |
 
 ### 6.4 Categories
 
@@ -776,6 +778,39 @@ Sent from the Client (via the Gateway) back to the Agent when a Human Principal 
 | `delegated` | The action was resolved by a delegate, not the primary principal. |
 | `escalated` | The action was resolved by an escalation-tier responder, not the primary principal. |
 
+### 8.4 Evidence (OPTIONAL)
+
+Action Responses MAY include an `evidence` field containing cryptographic proof of the human's authentication at the time of resolution. This field enables non-repudiable audit trails without changing the core HMAC signing mechanism.
+
+```json
+{
+  "request_message_id": "01936d87-7e1a-7f3b-a8c2-4d5e6f7a8b9c",
+  "selected_action_id": "deploy_prod",
+  "resolved_by": "user:fahad",
+  "resolution_type": "human_decision",
+  "resolved_at": "2026-03-01T12:30:00.000Z",
+  "evidence": {
+    "factor": "passkey.webauthn.v1",
+    "proof": { "credentialId": "...", "authenticatorData": "...", "signature": "..." },
+    "collected_at": "2026-03-01T12:29:58.000Z"
+  }
+}
+```
+
+The `evidence` field is an opaque JSON object defined by the gateway implementation. The specification does not mandate a schema for evidence. Common patterns include:
+
+| Factor type | Description |
+|---|---|
+| `passkey.webauthn.v1` | WebAuthn/FIDO2 assertion from a passkey |
+| `otp.totp.v1` | Time-based OTP verification receipt |
+| `oauth2.id_token.v1` | Truncated OIDC id_token claims (sub, iat, auth_time) |
+
+When present, the `evidence` field MUST be included in the audit trail record. Auditors MAY independently verify evidence proofs to establish non-repudiation.
+
+### 8.5 Identity Extensibility
+
+The `agent_id`, `principal_id`, and `resolved_by` fields are opaque strings. Implementations MAY use any naming convention including URIs, Decentralized Identifiers (DIDs), OAuth client IDs, or application-specific identifiers.
+
 ---
 
 ## 9. Governance & Policy Engine
@@ -822,7 +857,7 @@ Controls how much a single agent can spend within a session or time period.
 
 > **Implementation note (v0.2):** The reference Gateway enforces `session` semantics only. `hourly`, `daily`, and `sliding_window_*` values are accepted but treated as `session`. Full window-type support is reserved for v0.3.
 
-#### 9.3.2 `auto_resolution` — Automatic Approval/Denial
+#### 9.3.2 `auto_resolution` — Automatic Approval/Denial *(Informative, Non-Normative)*
 
 Enables the Gateway to resolve Action Requests without human intervention when conditions are met.
 
@@ -1428,7 +1463,49 @@ Hook implementations are not defined by RAMP — backend integrations are implem
 - Agent API keys MUST support rotation without downtime. The Gateway MUST accept both the current and previous key for a configurable grace period (default: 24 hours).
 - The Gateway MUST emit an audit record when a key is rotated.
 
----
+### 11.4 Cryptographic Agility (Informative)
+
+> **Status:** This section is informative. HMAC-SHA256 remains the MUST-support signing mechanism for RAMP v0.2. JWS support is a SHOULD-level recommendation for production deployments.
+
+#### 11.4.1 Motivation
+
+The baseline HMAC-SHA256 signing scheme (Section 4.2) provides message integrity and authentication using pre-shared secrets. This is sufficient for single-tenant deployments where the agent and gateway share a trust boundary. However, HMAC provides **symmetric** authentication — any party holding the shared secret can produce valid signatures. This limits non-repudiation: the gateway cannot prove to a third party that a specific agent (rather than the gateway itself) authored a message.
+
+For multi-tenant, cross-organizational, or regulatory-grade deployments, **asymmetric** signatures provide stronger guarantees:
+
+- **Non-repudiation:** Only the private key holder can produce a valid signature.
+- **Third-party verification:** Auditors can verify signatures using public keys without holding secrets.
+- **Key distribution:** Public keys can be distributed via standard discovery mechanisms (JWKS endpoints) without exposing secrets.
+
+#### 11.4.2 Recommended JWS Profile
+
+Production deployments SHOULD support JSON Web Signature (JWS, RFC 7515) as an alternative signing mechanism. The recommended profile:
+
+| Parameter | Recommendation |
+|---|---|
+| **Algorithm** | `Ed25519` (EdDSA, RFC 8037) preferred; `ES256` (ECDSA P-256, RFC 7518) acceptable |
+| **Key representation** | JWK (RFC 7517) |
+| **Key discovery** | JWKS endpoint at `/.well-known/jwks.json` on the agent's domain |
+| **Signature format** | Detached JWS (RFC 7797) over RFC 8785 JCS-canonicalized payload |
+
+When JWS is used, the `signature` field in the message envelope MUST contain a detached JWS compact serialization instead of the HMAC hex digest. Gateways MUST distinguish between HMAC and JWS signatures by the presence of the `.` delimiter (JWS compact serialization contains two periods; HMAC hex digests do not).
+
+#### 11.4.3 Version Negotiation
+
+Gateways supporting JWS SHOULD advertise this in the `/ramp/v1/info` discovery response:
+
+```json
+{
+  "signing_methods": ["hmac-sha256", "jws-ed25519", "jws-es256"],
+  "jwks_uri": "https://gateway.example.com/.well-known/jwks.json"
+}
+```
+
+Agents SHOULD check the gateway's supported signing methods during registration and select the strongest mutually supported method.
+
+#### 11.4.4 Backward Compatibility
+
+Gateways MUST continue to accept HMAC-SHA256 signatures even when JWS is supported. This ensures backward compatibility with agents that cannot perform asymmetric cryptography (e.g., constrained environments, rapid prototyping). The Conformance Levels (Section 14) do not change: HMAC-SHA256 is sufficient for all levels.
 
 ## 12. Transport Bindings
 
@@ -1547,7 +1624,7 @@ Implementations may claim conformance at different levels:
 |---|---|---|---|
 | Agent → Human notifications | Not designed for this | Possible but awkward (human as "agent") | First-class primitive |
 | Structured HITL with timeout/fallback | No | Task "input needed" exists but lacks timeout, risk assessment, delegation | Full lifecycle support |
-| Governance policy enforcement | No | No | 7 normative rule types + 4 informative extensions, with formal precedence (Section 9) |
+| Governance policy enforcement | No | No | 6 governance rule types + optional auto-resolution + 4 informative enterprise extensions, with formal precedence (Section 9) |
 | Capability permissions (action scope) | No | No | `action_scope` rules controlling what agents can do, not just spend |
 | Cross-agent budget controls | No | No | `aggregate_constraint` with sliding windows |
 | Privacy / data minimization (GDPR Art. 25) | No | No | Achievable via `action_scope` rules; dedicated `data_access` rule type available as informative extension |

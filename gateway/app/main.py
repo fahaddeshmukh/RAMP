@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import store
-from app.policies import evaluate_message, PolicyViolation, reset_session_costs
+from app.policies import evaluate_message, PolicyViolation, reset_session_costs, set_session_start_time
 from app.store import (
     action_events,
     agents,
@@ -179,6 +179,7 @@ async def start_session(agent_id: str, request: Request):
     agent_states[agent_id] = "IDLE"
     last_seq[agent_id] = 0
     reset_session_costs(agent_id)
+    set_session_start_time(agent_id, sessions[session_id]["started_at"])
 
     await append_audit("session_started", agent_id=agent_id, session_id=session_id)
     push_event({"type": "session_started", "agent_id": agent_id, "session_id": session_id})
@@ -301,8 +302,9 @@ async def receive_message(agent_id: str, request: Request):
         })
 
         status_code = 429 if pv.on_violation == "throttle_and_warn" else 403
+        error_code = "RAMP-4014" if pv.on_violation == "throttle_and_warn" else "RAMP-4011"
         raise HTTPException(status_code, {
-            "error_code": "RAMP-4011",
+            "error_code": error_code,
             "message": pv.message,
             "rule_id": pv.rule_id,
             "on_violation": pv.on_violation,
@@ -441,6 +443,7 @@ async def resolve_action(message_id: str, request: Request):
     selected_action_id = body.get("selected_action_id")
     reason = body.get("reason", "")
     resolver_id = body.get("resolver_id", "user:principal")
+    evidence = body.get("evidence")  # optional human-auth proof (spec §8.4)
 
     # mandatory_hitl guard: policy auto-resolution is forbidden when the rule fired
     if action.get("mandatory_hitl") and resolution_type_req in ("policy_auto_approved", "policy_auto_denied"):
@@ -459,6 +462,7 @@ async def resolve_action(message_id: str, request: Request):
         "resolver_role": body.get("resolver_role", "owner"),
         "resolved_at": resolved_at,
         "reason": reason,
+        "evidence": evidence,
     }
     resolved_actions[message_id] = response
 

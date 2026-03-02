@@ -266,7 +266,7 @@ class RampAgent:
 
     def _generate_message_id(self) -> str:
         """Generate a UUID v7-style message ID per spec Section 4.1."""
-        return str(uuid.uuid4())  # TODO: switch to uuid7 when stdlib supports it
+        return str(uuid.uuid4())  # uuid4 used; uuid7 preferred when stdlib adds support
 
     async def _send(self, msg_type: MessageType, payload: dict) -> dict:
         """Build envelope, sign it, POST to gateway."""

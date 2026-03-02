@@ -24,6 +24,8 @@ from app.policies import (
     aggregate_telemetry_costs,
     aggregate_action_costs,
     action_request_costs,
+    session_start_times,
+    message_timestamps,
 )
 
 
@@ -51,6 +53,7 @@ async def client():
     aggregate_telemetry_costs.clear()
     aggregate_action_costs.clear()
     action_request_costs.clear()
+    session_start_times.clear()
 
     # Manually trigger lifespan (init_db)
     await store.init_db()
@@ -274,6 +277,57 @@ async def test_cost_tracking_cumulative(client):
     resp = await client.post(f"/ramp/v1/agents/{AGENT_ID}/messages", json=env, headers=HEADERS)
     assert resp.status_code == 403
     assert resp.json()["detail"]["error_code"] == "RAMP-4011"
+
+
+# ---------------------------------------------------------------------------
+# Policy enforcement: resource_constraint — wall_time_seconds (gateway clock)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_wall_time_constraint_within_limit(client):
+    """Messages within the wall-time limit should pass."""
+    await _setup_agent(client)
+
+    set_policies(AGENT_ID, [{
+        "rule_id": "max_duration",
+        "type": "resource_constraint",
+        "resource": "wall_time_seconds",
+        "limit": 3600,  # 1 hour
+        "on_violation": "suspend_and_notify",
+    }])
+
+    env = _envelope("msg_wt_ok", 1, "telemetry", {
+        "state": "EXECUTING", "task_description": "working",
+    })
+    resp = await client.post(f"/ramp/v1/agents/{AGENT_ID}/messages", json=env, headers=HEADERS)
+    assert resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_wall_time_constraint_exceeded(client):
+    """Session exceeding wall-time limit should be suspended."""
+    await _setup_agent(client)
+
+    set_policies(AGENT_ID, [{
+        "rule_id": "max_duration",
+        "type": "resource_constraint",
+        "resource": "wall_time_seconds",
+        "limit": 10,  # 10 seconds
+        "on_violation": "suspend_and_notify",
+    }])
+
+    # Backdate the session start so elapsed > 10 seconds
+    from app.policies import session_start_times
+    session_start_times[AGENT_ID] = time.time() - 60  # 60 seconds ago
+
+    env = _envelope("msg_wt_fail", 1, "telemetry", {
+        "state": "EXECUTING", "task_description": "overtime",
+    })
+    resp = await client.post(f"/ramp/v1/agents/{AGENT_ID}/messages", json=env, headers=HEADERS)
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["error_code"] == "RAMP-4011"
+    assert "duration" in detail["message"].lower() or "exceeds limit" in detail["message"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -942,3 +996,41 @@ async def test_action_request_without_risk_assessment_rejected(client):
     assert resp.status_code == 400
     assert resp.json()["detail"]["error_code"] == "RAMP-4001"
 
+
+# ---------------------------------------------------------------------------
+# Policy enforcement: rate_constraint — throttle_and_warn drops messages
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_throttle_and_warn_drops_excess_messages(client):
+    """throttle_and_warn MUST drop excess messages with 429 + RAMP-4014 (spec §9.6.1)."""
+    await _setup_agent(client)
+
+    # Very low rate limit: 2 messages per 60s window
+    set_policies(AGENT_ID, [{
+        "rule_id": "strict_rate",
+        "type": "rate_constraint",
+        "max_messages": 2,
+        "window_seconds": 60,
+        "on_violation": "throttle_and_warn",
+    }])
+    # Clear any timestamps from setup
+    message_timestamps.pop(AGENT_ID, None)
+
+    # First 2 messages should succeed
+    for i in range(2):
+        env = _envelope(f"msg_rate_{i}", i + 1, "telemetry", {
+            "state": "EXECUTING", "task_description": "working",
+        })
+        resp = await client.post(f"/ramp/v1/agents/{AGENT_ID}/messages", json=env, headers=HEADERS)
+        assert resp.status_code == 200, f"Message {i} should pass (got {resp.status_code})"
+
+    # Third message MUST be dropped with 429
+    env = _envelope("msg_rate_excess", 3, "telemetry", {
+        "state": "EXECUTING", "task_description": "one too many",
+    })
+    resp = await client.post(f"/ramp/v1/agents/{AGENT_ID}/messages", json=env, headers=HEADERS)
+    assert resp.status_code == 429
+    detail = resp.json()["detail"]
+    assert detail["error_code"] == "RAMP-4014"
+    assert detail["on_violation"] == "throttle_and_warn"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,25 @@ class ActionRequestPayload(BaseModel):
     risk_assessment: RiskAssessment
     context: dict[str, Any] | None = None
 
+    @model_validator(mode="after")
+    def _validate_fallback(self) -> "ActionRequestPayload":
+        if self.fallback_action_id is None:
+            import warnings as _w
+            _w.warn(
+                "RAMP spec §7.3: fallback_action_id SHOULD reference a valid "
+                "option action_id. Omitting it means no safe fallback on timeout.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif self.options:
+            valid_ids = {o.action_id for o in self.options}
+            if self.fallback_action_id not in valid_ids:
+                raise ValueError(
+                    f"fallback_action_id '{self.fallback_action_id}' is not "
+                    f"among the option action_ids: {valid_ids}"
+                )
+        return self
+
 
 class ActionResponsePayload(BaseModel):
     request_message_id: str
@@ -155,3 +174,4 @@ class ActionResponsePayload(BaseModel):
     resolved_at: str | None = None
     response_latency_ms: int | None = None
     reason: str | None = None
+    evidence: dict[str, Any] | None = None  # spec §8.4: opaque human authentication proof

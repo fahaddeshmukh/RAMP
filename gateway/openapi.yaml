@@ -1,0 +1,822 @@
+openapi: 3.1.0
+info:
+  title: RAMP Gateway API
+  version: 0.2.0
+  description: |
+    Reference HTTP binding for the Remote Agent Monitoring Protocol (RAMP) v0.2.
+
+    > **Note:** RAMP is transport-agnostic — the protocol defines message semantics,
+    > not wire format. This OpenAPI document describes one conformant HTTP binding.
+    > WebSocket, gRPC, or MQTT implementations would expose different transport
+    > interfaces with the same message semantics.
+
+    ## Authentication
+    All endpoints (except `/health`) require the `X-RAMP-API-Key` header.
+    In production, this should be replaced with OAuth 2.0 or mTLS.
+
+    ## Error Model
+    All error responses use a consistent schema with `error_code` (RAMP-4xxx)
+    and `message` fields.
+  contact:
+    name: Fahad Deshmukh
+    email: fahad.deshmukh@htw-berlin.de
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+
+# --------------------------------------------------------------------------
+# Security
+# --------------------------------------------------------------------------
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-RAMP-API-Key
+      description: Static API key for the reference implementation. Replace with OAuth 2.0 / mTLS in production.
+
+  schemas:
+    # ── Error ────────────────────────────────────────────────────────────
+    RampError:
+      type: object
+      required: [error_code, message]
+      properties:
+        error_code:
+          type: string
+          description: RAMP error code (e.g., RAMP-4001, RAMP-4008).
+          example: RAMP-4001
+        message:
+          type: string
+          example: "Missing field: agent_id"
+
+    # ── Agent Registration ───────────────────────────────────────────────
+    RegisterAgentRequest:
+      type: object
+      required: [agent_id]
+      properties:
+        agent_id:
+          type: string
+          description: Globally unique agent identifier (spec §4.3).
+          example: "agent:coding-assistant"
+        agent_name:
+          type: string
+          description: Human-readable display name.
+          example: Coding Assistant
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: List of agent capabilities.
+          example: ["code_generation", "code_review"]
+
+    RegisterAgentResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: registered
+        agent_id:
+          type: string
+        negotiated_version:
+          type: string
+          example: "0.2"
+        ramp_versions_supported:
+          type: object
+          properties:
+            min:
+              type: string
+              example: "0.2.0"
+            max:
+              type: string
+              example: "0.2.0"
+        shared_secret:
+          type: string
+          description: HMAC signing key for this agent's messages.
+
+    # ── Session ──────────────────────────────────────────────────────────
+    StartSessionRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          type: string
+          description: Unique session identifier provided by the agent.
+          example: sess_abc123
+
+    StartSessionResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: created
+        session_id:
+          type: string
+
+    # ── RAMP Message Envelope (spec §4.1) ────────────────────────────────
+    MessageEnvelope:
+      type: object
+      required:
+        - ramp_version
+        - message_id
+        - agent_id
+        - session_id
+        - principal_id
+        - timestamp
+        - sequence_number
+        - message_type
+        - nonce
+        - signature
+        - payload
+      properties:
+        ramp_version:
+          type: string
+          example: "0.2.0"
+        message_id:
+          type: string
+          description: Unique message identifier (UUIDv7 recommended).
+          example: msg_01JBCDEFG
+        agent_id:
+          type: string
+          example: "agent:coding-assistant"
+        session_id:
+          type: string
+          example: sess_abc123
+        principal_id:
+          type: string
+          description: Identifier of the human principal.
+          example: "user:alice"
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO 8601 UTC timestamp. Must be within 5 minutes of gateway time.
+          example: "2026-03-01T12:00:00.000Z"
+        sequence_number:
+          type: integer
+          description: Monotonically increasing per session.
+          minimum: 1
+        message_type:
+          type: string
+          enum: [telemetry, notification, action_request]
+          description: The type of message being sent.
+        nonce:
+          type: string
+          description: Cryptographic random value, unique per session. Used for replay protection.
+        signature:
+          type: string
+          description: HMAC-SHA256 hex digest over canonical JSON (excluding signature field).
+        payload:
+          type: object
+          description: Type-specific payload. Schema depends on `message_type`.
+
+    MessageAcceptedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: accepted
+        message_id:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+          description: Non-fatal policy warnings (e.g., budget approaching threshold).
+
+    # ── Action Resolution ────────────────────────────────────────────────
+    ResolveActionRequest:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: [approved, denied]
+          example: approved
+        resolution_type:
+          type: string
+          default: human_decision
+          enum:
+            - human_decision
+            - policy_auto_approved
+            - policy_auto_denied
+            - delegated
+            - escalated
+        selected_action_id:
+          type: string
+          description: The action_id chosen from the Action Request options.
+          example: approve_deploy
+        reason:
+          type: string
+          description: Free-text explanation for the decision.
+        resolver_id:
+          type: string
+          example: "user:alice"
+        resolver_role:
+          type: string
+          example: owner
+        evidence:
+          type: object
+          nullable: true
+          description: |
+            Optional human authentication proof (spec §8.4). Opaque JSON object
+            containing cryptographic evidence of the resolver's identity verification
+            (e.g., WebAuthn assertion, OTP receipt, OIDC id_token claims).
+
+    ActionResponse:
+      type: object
+      properties:
+        request_message_id:
+          type: string
+        resolution_type:
+          type: string
+        selected_action_id:
+          type: string
+        resolved_by:
+          type: string
+        resolver_role:
+          type: string
+        resolved_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+        evidence:
+          type: object
+          nullable: true
+          description: |
+            Optional human authentication proof (spec §8.4). Present when the
+            gateway collected identity verification evidence during resolution.
+
+    # ── Gateway Info ─────────────────────────────────────────────────────
+    GatewayInfoResponse:
+      type: object
+      properties:
+        gateway_id:
+          type: string
+          example: "gateway:ramp-reference"
+        ramp_versions_supported:
+          type: object
+          properties:
+            min:
+              type: string
+            max:
+              type: string
+        conformance_level:
+          type: integer
+          description: "Conformance level (1=Observable, 2=Decidable, 3=Governed, 4=Auditable)."
+          example: 3
+        transport_bindings:
+          type: array
+          items:
+            type: string
+          example: ["http", "websocket"]
+        server_time:
+          type: string
+          format: date-time
+
+    # ── Policy Violation ─────────────────────────────────────────────────
+    PolicyViolationError:
+      type: object
+      properties:
+        error_code:
+          type: string
+          description: RAMP-4011 for policy violations, RAMP-4014 for rate limiting.
+          example: RAMP-4011
+        message:
+          type: string
+        rule_id:
+          type: string
+        on_violation:
+          type: string
+          enum:
+            - deny_and_notify
+            - suspend_and_notify
+            - suspend_until_allowed
+            - suspend_all_and_notify
+            - throttle_and_warn
+        agent_new_state:
+          type: string
+          nullable: true
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      security: []
+      tags: [Operations]
+      responses:
+        "200":
+          description: Gateway is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "0.2.0"
+                  protocol:
+                    type: string
+                    example: RAMP
+
+  /ramp/v1/info:
+    get:
+      summary: Gateway capability discovery
+      description: |
+        Returns supported RAMP versions, conformance level, and transport bindings.
+        Agents SHOULD call this endpoint before registration to verify compatibility (spec §4.7.3).
+      operationId: gatewayInfo
+      security: []
+      tags: [Discovery]
+      responses:
+        "200":
+          description: Gateway capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayInfoResponse"
+
+  # ── Agent Registration ─────────────────────────────────────────────────
+  /ramp/v1/agents/register:
+    post:
+      summary: Register a new agent
+      description: |
+        Registers an agent with the gateway and returns a shared secret for HMAC signing.
+        The agent transitions to the REGISTERED state (spec §3.1).
+      operationId: registerAgent
+      tags: [Agent Lifecycle]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterAgentRequest"
+      responses:
+        "200":
+          description: Agent registered successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterAgentResponse"
+        "400":
+          description: Missing required fields.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "409":
+          description: Agent already registered (RAMP-4010).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  /ramp/v1/agents:
+    get:
+      summary: List all agents
+      operationId: listAgents
+      security: []
+      tags: [Agent Lifecycle]
+      responses:
+        "200":
+          description: List of registered agents with current state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        agent_id:
+                          type: string
+                        agent_name:
+                          type: string
+                        state:
+                          type: string
+                          enum: [REGISTERED, IDLE, EXECUTING, AWAITING_HUMAN_INPUT, SUSPENDED, ERRORED, TERMINATED]
+
+  /ramp/v1/agents/{agent_id}:
+    get:
+      summary: Get agent details
+      operationId: getAgent
+      security: []
+      tags: [Agent Lifecycle]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Agent details with current state.
+        "404":
+          description: Unknown agent (RAMP-4008).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  # ── Session Management ─────────────────────────────────────────────────
+  /ramp/v1/agents/{agent_id}/sessions:
+    post:
+      summary: Start a new session
+      description: |
+        Creates a new session for the agent. The agent transitions from
+        REGISTERED → IDLE (spec §3.2). Only one active session per agent.
+      operationId: startSession
+      tags: [Session Management]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartSessionRequest"
+      responses:
+        "200":
+          description: Session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartSessionResponse"
+        "404":
+          description: Unknown agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "409":
+          description: Session already active (RAMP-4016).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  /ramp/v1/agents/{agent_id}/sessions/{session_id}/end:
+    post:
+      summary: End a session
+      description: Ends the session and transitions the agent to TERMINATED.
+      operationId: endSession
+      tags: [Session Management]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session ended.
+
+  /ramp/v1/agents/{agent_id}/resume:
+    post:
+      summary: Resume a suspended agent
+      description: |
+        Resumes an agent from SUSPENDED → IDLE (spec §9.6.2).
+        Only valid when the agent is in the SUSPENDED state.
+      operationId: resumeAgent
+      tags: [Agent Lifecycle]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Agent resumed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: resumed
+                  agent_id:
+                    type: string
+                  state:
+                    type: string
+                    example: IDLE
+        "409":
+          description: Agent is not in SUSPENDED state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  # ── Message Ingestion ──────────────────────────────────────────────────
+  /ramp/v1/agents/{agent_id}/messages:
+    post:
+      summary: Send a RAMP message
+      description: |
+        Primary message ingestion endpoint for all RAMP message types:
+        `telemetry`, `notification`, and `action_request`.
+
+        The gateway performs the following validation pipeline:
+        1. **Envelope validation** — all required fields present
+        2. **Idempotency** — `message_id` not previously seen (RAMP-4006)
+        3. **Timestamp** — within 5-minute window (spec §4.2)
+        4. **Nonce replay protection** — unique nonce (RAMP-4007)
+        5. **HMAC signature verification** (RAMP-4002)
+        6. **Sequence ordering** — monotonically increasing (RAMP-4003)
+        7. **Policy evaluation** — all governance rules in precedence order
+        8. **State transition validation** — per the 7-state lifecycle (RAMP-4004)
+        9. **Type-specific validation** — e.g., `risk_assessment` required for action requests
+      operationId: receiveMessage
+      tags: [Messages]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageEnvelope"
+      responses:
+        "200":
+          description: Message accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageAcceptedResponse"
+        "400":
+          description: Validation error (missing fields, invalid timestamp, bad sequence, invalid state transition).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "401":
+          description: Invalid HMAC signature (RAMP-4002).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "403":
+          description: Policy violation — message denied (RAMP-4011).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyViolationError"
+        "404":
+          description: Unknown agent (RAMP-4008).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "409":
+          description: Duplicate message (RAMP-4006).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "429":
+          description: Rate limited — message dropped (RAMP-4014).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyViolationError"
+
+  # ── Action Resolution ──────────────────────────────────────────────────
+  /ramp/v1/actions/{message_id}/resolve:
+    post:
+      summary: Resolve an Action Request
+      description: |
+        Human principal resolves a pending Action Request by approving or denying it.
+        The agent transitions from AWAITING_HUMAN_INPUT → EXECUTING.
+      operationId: resolveAction
+      tags: [Human-in-the-Loop]
+      parameters:
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The `message_id` of the original Action Request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveActionRequest"
+      responses:
+        "200":
+          description: Action resolved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: resolved
+                  resolution_type:
+                    type: string
+                    example: human_decision
+        "403":
+          description: Mandatory HITL — automated resolution forbidden (RAMP-4011).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "404":
+          description: Action request not found (RAMP-4008).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+        "409":
+          description: Action already resolved (RAMP-4017).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  /ramp/v1/agents/{agent_id}/actions/{message_id}/response:
+    get:
+      summary: Poll for action response
+      description: |
+        Agent polls for the human's decision on an Action Request.
+
+        Supports **long-polling** via the `wait` query parameter: the gateway
+        holds the connection open until the action is resolved or the wait
+        period elapses (max 120 seconds).
+
+        If the action's `timeout_seconds` has elapsed, the gateway automatically
+        resolves with `timeout_fallback` using the `fallback_action_id`.
+      operationId: getActionResponse
+      tags: [Human-in-the-Loop]
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: wait
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 120
+            default: 0
+          description: Long-poll wait time in seconds (0 = immediate return).
+      responses:
+        "200":
+          description: Action status (pending or resolved).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      status:
+                        type: string
+                        example: pending
+                      elapsed_seconds:
+                        type: integer
+                  - type: object
+                    properties:
+                      status:
+                        type: string
+                        example: resolved
+                      response:
+                        $ref: "#/components/schemas/ActionResponse"
+        "404":
+          description: Action request not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RampError"
+
+  /ramp/v1/actions/pending:
+    get:
+      summary: List pending actions
+      description: Returns all Action Requests currently awaiting human response.
+      operationId: listPendingActions
+      security: []
+      tags: [Human-in-the-Loop]
+      responses:
+        "200":
+          description: List of pending actions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pending_actions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        message_id:
+                          type: string
+                        agent_id:
+                          type: string
+                        status:
+                          type: string
+                          example: pending
+                        elapsed_seconds:
+                          type: integer
+
+  # ── Audit Trail ────────────────────────────────────────────────────────
+  /ramp/v1/audit:
+    get:
+      summary: Query audit trail
+      description: |
+        Returns hash-chained audit records. Each record includes a SHA-256 hash
+        of its contents and the hash of the preceding record, enabling
+        tamper-evident sequential verification (spec §8).
+      operationId: getAudit
+      security: []
+      tags: [Audit]
+      parameters:
+        - name: agent_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by agent.
+        - name: event_type
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by event type (e.g., `agent_registered`, `policy_violated`, `action_resolved`).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Audit records.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  records:
+                    type: array
+                    items:
+                      type: object
+                  count:
+                    type: integer
+
+tags:
+  - name: Discovery
+    description: Gateway capability discovery and version negotiation.
+  - name: Agent Lifecycle
+    description: Agent registration, state management, and suspension/resume.
+  - name: Session Management
+    description: Session creation and termination.
+  - name: Messages
+    description: Primary message ingestion (telemetry, notifications, action requests).
+  - name: Human-in-the-Loop
+    description: Action Request resolution and polling.
+  - name: Audit
+    description: Tamper-evident audit trail queries.
+  - name: Operations
+    description: Health checks and operational endpoints.

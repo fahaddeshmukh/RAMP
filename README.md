@@ -154,11 +154,12 @@ Without RAMP, deploying autonomous agents at scale leads to:
 | Path | Contents |
 |---|---|
 | `/docs/ramp_protocol_spec_v2.md` | The complete RAMP v0.2 Protocol Specification |
-| `/docs/concept.md` | Project concept and two-layer architecture overview |
-| `/docs/advanced_architecture.md` | Advanced architecture: local agents, enterprise deployments, fleet dashboards |
-| `/sdk/` | Python RAMP SDK |
+| `/docs/mcp_integration.md` | MCP tool-binding integration guide (4 canonical tools) |
 | `/gateway/` | FastAPI Reference Gateway (policy enforcement, HMAC, audit trail) |
+| `/gateway/openapi.yaml` | OpenAPI 3.1.0 machine-readable API specification |
+| `/sdk/` | Python RAMP SDK |
 | `/examples/` | Runnable example agents demonstrating HITL flows |
+| `/skills/ramp-governance/` | RAMP governance Agent Skill (Copilot / IDE integration) |
 
 ---
 

@@ -36,7 +36,14 @@ Thumbs.db
 # Private / internal docs (not for public repo)
 docs/internal/
 docs/competitive_analysis_and_strategy.md
+docs/concept.md
+docs/advanced_architecture.md
 docs/_archive/
+paper/
+
+# Coverage
+.coverage
 
 # Pytest
 .pytest_cache/
+Agent2Human/

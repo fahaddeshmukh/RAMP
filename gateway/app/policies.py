@@ -1,12 +1,12 @@
 """Governance policy engine — enforces Level 3 conformance rule types.
 
 Implements 6 rule types per RAMP spec Section 9:
-  - mandatory_hitl       (precedence 2)
-  - action_scope         (precedence 3)
-  - aggregate_constraint (precedence 5)
-  - resource_constraint  (precedence 6)
-  - time_constraint      (precedence 7)
-  - rate_constraint      (precedence 8)
+  - mandatory_hitl       (precedence 1)
+  - action_scope         (precedence 2)
+  - aggregate_constraint (precedence 3)
+  - resource_constraint  (precedence 4)
+  - time_constraint      (precedence 5)
+  - rate_constraint      (precedence 6)
 
 Rules are evaluated in precedence order (lowest number = highest priority).
 The first hard violation wins; warnings accumulate.
@@ -66,6 +66,10 @@ aggregate_action_costs: dict[str, dict[str, float]] = {}
 # Action request costs are additive — each request contributes its estimated_cost_usd.
 action_request_costs: dict[str, float] = {}
 
+# agent_id -> session start time (epoch seconds) — set by the gateway, used
+# for objective wall_time_seconds enforcement without relying on agent telemetry.
+session_start_times: dict[str, float] = {}
+
 
 def get_policies(agent_id: str) -> list[dict[str, Any]]:
     """Get active policies for an agent."""
@@ -83,12 +87,12 @@ def set_policies(agent_id: str, rules: list[dict[str, Any]]) -> None:
 
 # Evaluation precedence per spec Section 9.4
 _RULE_PRECEDENCE: dict[str, int] = {
-    "mandatory_hitl": 2,
-    "action_scope": 3,
-    "aggregate_constraint": 5,
-    "resource_constraint": 6,
-    "time_constraint": 7,
-    "rate_constraint": 8,
+    "mandatory_hitl": 1,
+    "action_scope": 2,
+    "aggregate_constraint": 3,
+    "resource_constraint": 4,
+    "time_constraint": 5,
+    "rate_constraint": 6,
 }
 
 
@@ -255,11 +259,35 @@ def _eval_aggregate_constraint(
 
 
 def _eval_resource_constraint(rule: dict, msg_type: str, payload: dict, agent_id: str) -> None:
-    """resource_constraint — per-agent session spending limit.
+    """resource_constraint — per-agent session spending or duration limit.
 
-    Tracks costs from both telemetry (cumulative, direct assignment) and
-    Action Requests (additive: each request contributes its estimated_cost_usd).
+    For cost-based resources (llm_cost_usd): tracks costs from both telemetry
+    (cumulative, direct assignment) and Action Requests (additive: each request
+    contributes its estimated_cost_usd).
+
+    For wall_time_seconds: the Gateway computes elapsed time from its own clock
+    (session_start_times), requiring no agent self-reporting.  This is fully
+    objective — principal-declared limit, Gateway-measured time.
     """
+    resource = rule.get("resource", "llm_cost_usd")
+
+    # --- Wall-clock duration enforcement (gateway-measured, objective) ---
+    if resource == "wall_time_seconds":
+        start = session_start_times.get(agent_id)
+        if start is None:
+            return  # no session tracked yet
+        elapsed = time.time() - start
+        limit = rule.get("limit", float("inf"))
+        if elapsed > limit:
+            raise PolicyViolation(
+                rule_id=rule["rule_id"],
+                rule_type="resource_constraint",
+                message=f"Session duration {elapsed:.0f}s exceeds limit {limit:.0f}s",
+                on_violation=rule.get("on_violation", "suspend_and_notify"),
+            )
+        return
+
+    # --- Cost-based resource enforcement ---
     if msg_type == "telemetry":
         resources = payload.get("resources", {})
         # Accept both spec wire name (llm_cost_usd) and SDK convenience name (estimated_cost_usd)
@@ -332,17 +360,12 @@ def _eval_rate_constraint(rule: dict, agent_id: str, warnings: list[str]) -> Non
 
     if len(message_timestamps[agent_id]) > max_msgs:
         violation = rule.get("on_violation", "throttle_and_warn")
-        if violation == "throttle_and_warn":
-            warnings.append(
-                f"Rate limit: {len(message_timestamps[agent_id])}/{max_msgs} messages in {window}s window"
-            )
-        else:
-            raise PolicyViolation(
-                rule_id=rule["rule_id"],
-                rule_type="rate_constraint",
-                message=f"Rate limit exceeded: {len(message_timestamps[agent_id])}/{max_msgs} in {window}s",
-                on_violation=violation,
-            )
+        raise PolicyViolation(
+            rule_id=rule["rule_id"],
+            rule_type="rate_constraint",
+            message=f"Rate limit exceeded: {len(message_timestamps[agent_id])}/{max_msgs} in {window}s window",
+            on_violation=violation,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +377,9 @@ def reset_session_costs(agent_id: str) -> None:
     session_costs.pop(agent_id, None)
     action_request_costs.pop(agent_id, None)
     message_timestamps.pop(agent_id, None)
+    session_start_times.pop(agent_id, None)
+
+
+def set_session_start_time(agent_id: str, started_at: float) -> None:
+    """Record when a session started (gateway clock)."""
+    session_start_times[agent_id] = started_at
